@@ -1,0 +1,94 @@
+service: dave-mind
+
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: python3.11
+  region: us-east-1
+  memorySize: 512
+  timeout: 30
+  environment:
+    # SSM SecureString — resolved (KMS-decrypted) at DEPLOY time and baked
+    # into the Lambda environment. Rotate via `aws ssm put-parameter` +
+    # redeploy.
+    GROQ_API_KEY: ${ssm:/dave/groq-api-key}
+    GROQ_MODEL: llama-3.1-8b-instant
+    SESSION_BUCKET: dave-drawvid-sessions
+    SESSION_KEY_PREFIX: sessions/
+    TURN_LOG_BUCKET: dave-drawvid-turns
+    TURN_LOG_PREFIX: turns/
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+            - s3:PutObject
+          Resource: "arn:aws:s3:::dave-drawvid-sessions/sessions/*"
+        # ListBucket needed so GetObject on a missing key returns NoSuchKey
+        # cleanly (instead of AccessDenied). Scoped to the sessions/ prefix.
+        - Effect: Allow
+          Action:
+            - s3:ListBucket
+          Resource: "arn:aws:s3:::dave-drawvid-sessions"
+          Condition:
+            StringLike:
+              s3:prefix:
+                - "sessions/*"
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+          Resource: "arn:aws:s3:::dave-drawvid-turns/turns/*"
+  # Session TTL is enforced by the S3 bucket's 1-day lifecycle rule on the
+  # sessions/ prefix (configured at bucket creation). Turn-log archival is
+  # enforced by the bucket's 90d→Glacier / 365d-expire rule on turns/.
+
+custom:
+  customDomain:
+    domainName: davemind.drawvid.com
+    certificateArn: arn:aws:acm:us-east-1:593615615124:certificate/4f50765a-0d38-41ba-9651-0bf09aa5f0d4
+    endpointType: regional
+    securityPolicy: tls_1_2
+    autoDomain: false
+    createRoute53Record: true
+    hostedZoneId: Z6OEJ6TI3FSOM
+
+  pythonRequirements:
+    # Force Linux x86_64 wheels so binary deps like pydantic_core work on
+    # Lambda. Without this, packaging on macOS produces mac wheels that
+    # ImportError at cold start. Docker would be the canonical fix but
+    # this avoids the dependency.
+    pipCmdExtraArgs:
+      - "--platform"
+      - "manylinux2014_x86_64"
+      - "--only-binary=:all:"
+
+functions:
+  query:
+    handler: app.lambda_handler
+    events:
+      - http:
+          path: query
+          method: post
+          cors: true
+      - http:
+          path: health
+          method: get
+          cors: true
+
+plugins:
+  - serverless-python-requirements
+  - serverless-domain-manager
+
+package:
+  individually: true
+  patterns:
+    - "!node_modules/**"
+    - "!.git/**"
+    - "!.env"
+    - "!.venv/**"
+    - "!tests/**"
+    - "!requirements-dev.txt"
+    - "!package.json"
+    - "!package-lock.json"

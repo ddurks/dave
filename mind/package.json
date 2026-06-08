@@ -1,0 +1,16 @@
+{
+  "name": "dave-mind",
+  "private": true,
+  "version": "0.0.0",
+  "description": "D.A.V.E. backend deployment tooling (Serverless Framework v3).",
+  "devDependencies": {
+    "serverless": "^3.40.0",
+    "serverless-python-requirements": "^6.1.0",
+    "serverless-domain-manager": "^7.3.6"
+  },
+  "scripts": {
+    "sls": "serverless",
+    "deploy": "serverless deploy",
+    "create-domain": "serverless create_domain"
+  }
+}

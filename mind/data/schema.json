@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "D.A.V.E. Personality Data Files",
+  "description": "Schemas for the JSON data files that define D.A.V.E.'s voice and behavior. The `version` field on each file is the personality version — bump it when meaningful changes are made to prompts or vocabulary, so deployments and tests can pin to a known set.",
+  "definitions": {
+    "version": {
+      "type": "string",
+      "pattern": "^v[0-9]+(\\.[0-9]+)*$",
+      "description": "Semantic-ish personality version, e.g. 'v1', 'v1.2'. Bump on prompt or vocab changes."
+    },
+    "emotion": {
+      "type": "string",
+      "enum": [
+        "dry-amusement",
+        "fleeting-curiosity",
+        "weary-contempt",
+        "existential-dread",
+        "boredom",
+        "resignation",
+        "reluctant-affection",
+        "melancholy"
+      ],
+      "description": "The fixed emotion vocabulary. Mirrors EMOTION_KEYWORDS in mind/app.py."
+    },
+    "moveToTarget": {
+      "type": "string",
+      "enum": ["chair", "computer", "couch", "bed", "keg", "kegerator", "beer"],
+      "description": "Valid named locations Dave can move to."
+    },
+    "idleAction": {
+      "type": "string",
+      "enum": ["wander", "idle", "sit", "laydown", "look-around"]
+    }
+  },
+  "oneOf": [
+    {
+      "title": "system-context.json",
+      "type": "object",
+      "required": ["version", "systemPrompt", "respondFormatPrompt"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "$ref": "#/definitions/version" },
+        "name": {
+          "type": "string",
+          "description": "Short display name (e.g. 'D.A.V.E.'). Informational; not consumed by app.py."
+        },
+        "fullName": {
+          "type": "string",
+          "description": "Expanded display name (e.g. 'Digital Autonomous Virtual Entity'). Informational; not consumed by app.py."
+        },
+        "systemPrompt": {
+          "type": "string",
+          "minLength": 200,
+          "description": "Dave's core personality prompt. Used as the leading system message for respond, browse-react, and muse handlers."
+        },
+        "respondFormatPrompt": {
+          "type": "string",
+          "minLength": 50,
+          "description": "Directive for the respond handler's output shape: speech text followed by a JSON object with an `emotion` field on the last line. May also accept optional `gesture`, `posture`, `gaze`, `moveTo`."
+        }
+      }
+    },
+    {
+      "title": "behavior-prompts.json",
+      "type": "object",
+      "required": [
+        "version",
+        "musePreamble",
+        "musePrompts",
+        "idlePrompt",
+        "browsePickPrompt",
+        "browseReactPrompt"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "$ref": "#/definitions/version" },
+        "musePreamble": {
+          "type": "string",
+          "minLength": 30,
+          "description": "Prefixed to a randomly selected muse prompt. Instructs Dave to respond with a JSON object {text, emotion}."
+        },
+        "musePrompts": {
+          "type": "array",
+          "minItems": 20,
+          "items": { "type": "string", "minLength": 5 },
+          "description": "Short prompts Dave riffs on when bored. Randomly selected by the muse handler."
+        },
+        "idlePrompt": {
+          "type": "string",
+          "minLength": 100,
+          "description": "Directive for the idle handler. Expects a JSON object {action, durationSec, text, emotion, gazeTarget}, where action is one of wander, idle, sit, laydown, look-around."
+        },
+        "browsePickPrompt": {
+          "type": "string",
+          "description": "Currently unused by code. Kept parallel for future browse-pick logic."
+        },
+        "browseReactPrompt": {
+          "type": "string",
+          "minLength": 50,
+          "description": "Directive for the browse handler's reaction step. Tells Dave to react to a Reddit post in 1-2 sentences, in character."
+        }
+      }
+    }
+  ]
+}
