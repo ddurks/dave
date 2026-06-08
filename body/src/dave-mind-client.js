@@ -9,6 +9,14 @@ export class DaveMindClient {
     this.queryUrl = `${apiBaseUrl}/query`;
     this.sessionId = sessionId;
     this.userId = userId;
+    // Exponential backoff state — shared across all method types. When the
+    // backend 429s (rate limit) or 5xxs (real error), block further requests
+    // for an exponentially increasing window so the polling idle/browse loops
+    // don't hammer a failing endpoint at full rate.
+    this._consecutiveFailures = 0;
+    this._backoffUntil = 0;
+    this._BACKOFF_MIN_MS = 1000;
+    this._BACKOFF_MAX_MS = 60000;
   }
 
   /**
@@ -84,23 +92,65 @@ export class DaveMindClient {
   }
 
   /**
-   * Internal: Send a POST request to the backend
+   * Internal: Send a POST request to the backend with exponential backoff.
    * @private
    */
   async _post(body) {
-    const res = await fetch(this.queryUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-
-    if (!res.ok) {
-      const errorBody = await res.text();
-      console.error(`API error ${res.status}: ${errorBody}`);
-      throw new Error(`API error ${res.status}: ${errorBody}`);
+    const now = Date.now();
+    if (now < this._backoffUntil) {
+      const waitMs = this._backoffUntil - now;
+      throw new Error(`API backoff: retry in ${waitMs}ms`);
     }
 
-    return await res.json();
+    let res;
+    try {
+      res = await fetch(this.queryUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } catch (networkErr) {
+      // Network-level failure (DNS, offline, CORS preflight reject). Same
+      // treatment as a 5xx — back off so we don't hammer.
+      this._bumpBackoff();
+      throw networkErr;
+    }
+
+    if (res.ok) {
+      this._consecutiveFailures = 0;
+      this._backoffUntil = 0;
+      return await res.json();
+    }
+
+    // Back off on rate limits and server errors. Don't back off on 4xx-other
+    // (those are caller bugs and won't get better by waiting).
+    if (res.status === 429 || res.status >= 500) {
+      const retryAfter = res.headers.get("Retry-After");
+      const retryAfterMs =
+        retryAfter && !isNaN(parseFloat(retryAfter))
+          ? parseFloat(retryAfter) * 1000
+          : null;
+      this._bumpBackoff(retryAfterMs);
+    }
+
+    const errorBody = await res.text();
+    console.error(`API error ${res.status}: ${errorBody}`);
+    throw new Error(`API error ${res.status}: ${errorBody}`);
+  }
+
+  /**
+   * Compute the next backoff window. Doubles each consecutive failure up to
+   * BACKOFF_MAX_MS. A non-null explicitMs (from a Retry-After header) wins.
+   * @private
+   */
+  _bumpBackoff(explicitMs = null) {
+    this._consecutiveFailures += 1;
+    const exp = Math.min(
+      this._BACKOFF_MAX_MS,
+      this._BACKOFF_MIN_MS * 2 ** (this._consecutiveFailures - 1),
+    );
+    const delay = explicitMs && explicitMs > 0 ? explicitMs : exp;
+    this._backoffUntil = Date.now() + delay;
   }
 
   /**

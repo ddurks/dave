@@ -93,6 +93,21 @@
         pointer-events: none;
         text-shadow: 0 0 4px #000;
       }
+      #privacyNotice {
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        text-align: center;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        font-size: 10px;
+        color: #3a6b3a;
+        padding: 3px 0;
+        z-index: 8;
+        pointer-events: none;
+        background: rgba(10, 26, 14, 0.55);
+        letter-spacing: 0.3px;
+      }
       #muteBtn {
         position: fixed;
         top: 16px;
@@ -304,8 +319,12 @@
         type="text"
         placeholder="Talk to D.A.V.E..."
         autocomplete="off"
+        maxlength="2000"
       />
       <button id="sendBtn">Send</button>
+    </div>
+    <div id="privacyNotice">
+      Conversations are logged for analytics — please don't share personal info.
     </div>
 
     <!-- D.A.V.E. API Configuration -->

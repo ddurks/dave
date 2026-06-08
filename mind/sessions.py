@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from typing import Dict, List
 
@@ -27,38 +28,51 @@ SESSION_TTL_SECONDS = 3600   # Used by InMemorySessionStore; S3 uses lifecycle.
 
 
 class InMemorySessionStore:
-    """Dict-based session store. Expires entries on every write."""
+    """Dict-based session store. Expires entries on every write.
+
+    Thread-safe: Flask runs multi-threaded by default and warm Lambda
+    containers can serve multiple invocations concurrently. Without the
+    lock, two near-simultaneous appends on the same session can drop a
+    turn (read-modify-write race), or `_cleanup_expired` can mutate the
+    dict while another thread iterates (RuntimeError).
+    """
 
     def __init__(self):
         self._store: Dict[str, Dict] = {}
+        self._lock = threading.Lock()
 
     def get_turns(self, session_id: str) -> List[Dict[str, str]]:
-        now = time.time()
-        if session_id not in self._store:
-            self._store[session_id] = {"turns": [], "lastAccess": now}
-        entry = self._store[session_id]
-        entry["lastAccess"] = now
-        return entry["turns"]
+        with self._lock:
+            now = time.time()
+            if session_id not in self._store:
+                self._store[session_id] = {"turns": [], "lastAccess": now}
+            entry = self._store[session_id]
+            entry["lastAccess"] = now
+            # Return a shallow copy so callers can iterate without holding the lock.
+            return list(entry["turns"])
 
     def append_turn(self, session_id: str, role: str, content: str) -> None:
-        turns = self.get_turns(session_id)
-        turns.append({"role": role, "content": content})
-        if len(turns) > SESSION_MAX_TURNS:
-            del turns[: len(turns) - SESSION_MAX_TURNS]
-        self._cleanup_expired()
-
-    def _cleanup_expired(self) -> None:
-        now = time.time()
-        expired = [
-            sid for sid, s in self._store.items()
-            if now - s["lastAccess"] > SESSION_TTL_SECONDS
-        ]
-        for sid in expired:
-            del self._store[sid]
+        with self._lock:
+            now = time.time()
+            entry = self._store.setdefault(
+                session_id, {"turns": [], "lastAccess": now}
+            )
+            entry["lastAccess"] = now
+            entry["turns"].append({"role": role, "content": content})
+            if len(entry["turns"]) > SESSION_MAX_TURNS:
+                del entry["turns"][: len(entry["turns"]) - SESSION_MAX_TURNS]
+            # Inline cleanup so we don't double-acquire the lock.
+            expired = [
+                sid for sid, s in self._store.items()
+                if now - s["lastAccess"] > SESSION_TTL_SECONDS
+            ]
+            for sid in expired:
+                del self._store[sid]
 
     # Exposed for tests that want to reset state between cases.
     def clear(self) -> None:
-        self._store.clear()
+        with self._lock:
+            self._store.clear()
 
 
 class S3SessionStore:

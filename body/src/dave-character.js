@@ -405,6 +405,8 @@ export class Dave {
 
   startWander() {
     if (this._idleRequestPending) return;
+    // Don't ask Groq for an idle directive while the tab is in the background.
+    if (typeof document !== "undefined" && document.hidden) return;
     this._idleRequestPending = true;
 
     const context = {

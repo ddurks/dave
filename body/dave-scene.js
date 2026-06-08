@@ -11,7 +11,16 @@ import { CamCharacter, Screen, Lamp } from "./src/dave-enclosure.js";
 
 const API_BASE_URL = cfg.API.getBaseUrl();
 
-const SESSION_ID = cfg.USER.SESSION_ID_PREFIX + Date.now().toString(36);
+// Cryptographically random session id. The previous Date.now()-based id
+// was guessable in seconds; anyone could read or poison another visitor's
+// chat history. crypto.randomUUID is supported in every browser Vite
+// targets; the fallback is paranoia for older Safari.
+const SESSION_ID =
+  cfg.USER.SESSION_ID_PREFIX +
+  (typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2) +
+      Math.random().toString(36).slice(2));
 
 // Persistent user identity — survives page reloads / new sessions
 const STORED_USER_ID = localStorage.getItem(cfg.USER.STORAGE_KEY);
@@ -851,6 +860,8 @@ let browseInterval = null;
 
 async function doBrowse() {
   if (!isBrowsing || isBusy) return;
+  // Don't burn Groq calls + Lambda invokes while the tab is in the background.
+  if (typeof document !== "undefined" && document.hidden) return;
 
   try {
     drawScreenText("wikipedia.org", [
@@ -918,7 +929,10 @@ function startBrowsing() {
   setTimeout(() => {
     if (isBrowsing) doBrowse();
   }, 2000);
-  // Then browse every 25-40 seconds
+  // Then browse every 25-40 seconds. Clear any orphan from a prior
+  // onArrive that didn't get its onDepart (e.g. LLM-driven moveTo while
+  // Dave was already at the chair).
+  if (browseInterval) clearInterval(browseInterval);
   browseInterval = setInterval(
     () => {
       if (isBrowsing) doBrowse();
@@ -1605,9 +1619,24 @@ document.addEventListener("click", (event) => {
     event.target.closest("#pipBox") ||
     event.target.closest("#muteBtn") ||
     event.target.closest("#historyTab") ||
-    event.target.closest("#historyPanel")
+    event.target.closest("#historyPanel") ||
+    event.target.closest("#privacyNotice")
   ) {
     return;
   }
+  // Only fire when the click actually lands on Dave's mesh. Otherwise every
+  // accidental click on empty ground costs a Groq call.
+  const pick = scene.pick(scene.pointerX, scene.pointerY);
+  if (!pick?.hit || !pick.pickedMesh) return;
+  let mesh = pick.pickedMesh;
+  let onDave = false;
+  while (mesh) {
+    if (mesh === root || mesh === daveCapsule) {
+      onDave = true;
+      break;
+    }
+    mesh = mesh.parent;
+  }
+  if (!onDave) return;
   handleDaveTap();
 });
