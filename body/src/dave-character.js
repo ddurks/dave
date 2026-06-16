@@ -151,6 +151,15 @@ export class Dave {
     this.gettingUpTimer = 0; // Time to wait for reverse animation to finish
     this.currentAction = null; // Active ACTION_DEFS key (null = locomotion only)
 
+    // Stuck guard: detect when Dave is in a walking state but isn't actually
+    // making progress (pressed into furniture / pathfinder loop). Reset on
+    // every entry into a walking state and on _exitToIdle.
+    this._lastWalkPos = null;
+    this._lastWalkProgressAt = 0;
+    this._stuckAcknowledged = false;
+    this._STUCK_TIMEOUT_MS = 5000;
+    this._STUCK_PROGRESS_THRESHOLD = 0.05;
+
     // ── Animation ────────────────────────────────────────────────────────────
     const animGroups = imported.animationGroups;
     animGroups.forEach((ag) => ag.stop());
@@ -349,6 +358,12 @@ export class Dave {
       if (globalThis.DAVE_STRICT_FSM) throw new Error(msg);
     }
     this.state = newState;
+    // Reset stuck-guard baseline whenever a walking state begins.
+    if (newState === S.WALKING || newState === S.WALKING_TO_APPROACH) {
+      this._lastWalkPos = this.daveCapsule.position.clone();
+      this._lastWalkProgressAt = Date.now();
+      this._stuckAcknowledged = false;
+    }
   }
 
   // Cap durations so user-initiated paths can't park Dave on furniture forever.
@@ -1120,6 +1135,8 @@ export class Dave {
     this._setState(S.IDLE);
     this.wanderTimer = 1 + Math.random() * 3;
     this.animationController.playForward("idle", true);
+    this._lastWalkPos = null;
+    this._stuckAcknowledged = false;
   }
 
   leaveInteraction() {
@@ -1279,6 +1296,69 @@ export class Dave {
   }
 
   /**
+   * Per-frame stuck-guard check for walking states. Returns true if Dave is
+   * judged stuck this frame and a recovery has been kicked off (caller should
+   * skip its normal movement step).
+   *
+   * Stuck = no meaningful displacement for STUCK_TIMEOUT_MS. Recovery: dry
+   * grumble via muse, then re-pick a wander target. WALKING_TO_APPROACH
+   * additionally abandons the approach since the target furniture is the
+   * thing he can't reach.
+   */
+  _checkStuck() {
+    if (this._stuckAcknowledged) return false;
+    if (!this._lastWalkPos) return false;
+
+    const now = Date.now();
+    const pos = this.daveCapsule.position;
+    const dx = pos.x - this._lastWalkPos.x;
+    const dz = pos.z - this._lastWalkPos.z;
+    const moved = Math.sqrt(dx * dx + dz * dz);
+
+    if (moved > this._STUCK_PROGRESS_THRESHOLD) {
+      this._lastWalkPos = pos.clone();
+      this._lastWalkProgressAt = now;
+      return false;
+    }
+
+    if (now - this._lastWalkProgressAt < this._STUCK_TIMEOUT_MS) return false;
+
+    this._stuckAcknowledged = true;
+    const wasApproach = this.state === S.WALKING_TO_APPROACH;
+
+    // Non-blocking muse — gated by isMusing and tab visibility, mirroring
+    // _tickSpontaneousMuse so we don't burn API calls on a hidden tab.
+    const tabHidden = typeof document !== "undefined" && document.hidden;
+    if (!this.isMusing && !tabHidden) {
+      this.isMusing = true;
+      (async () => {
+        try {
+          const { response: r } = await this.mindClient.muse(
+            "You've been trying to walk somewhere but you keep getting stuck against something. Complain about it in one short, dry sentence.",
+          );
+          if (r?.text) {
+            this.expressionManager.setExpression(r.emotion);
+            this._lockExpression(3000);
+            if (this.onMutter) this.onMutter(r.text);
+          }
+        } catch {} finally {
+          this.isMusing = false;
+        }
+      })();
+    }
+
+    // Abandon the approach so Dave isn't redirected back to the same
+    // unreachable furniture; for plain WALKING just pick a fresh target.
+    if (wasApproach) {
+      this.leaveInteraction();
+      this._exitToIdle();
+    } else {
+      this._fallbackWander();
+    }
+    return true;
+  }
+
+  /**
    * Moves Dave toward this.wanderTarget along the nav path.
    * Stops and resets the path when within `arrivalThreshold` of the real target.
    * @returns {boolean} true when arrived
@@ -1426,6 +1506,7 @@ export class Dave {
     }
 
     if (this.state === S.WALKING) {
+      if (this._checkStuck()) return;
       if (this._walkToward(dt, 0.3)) this._exitToIdle();
       return;
     }
@@ -1441,6 +1522,7 @@ export class Dave {
     }
 
     if (this.state === S.WALKING_TO_APPROACH) {
+      if (this._checkStuck()) return;
       if (this._walkToward(dt, 0.15)) this._setState(S.ALIGNING_TO_INTERACT);
       return;
     }

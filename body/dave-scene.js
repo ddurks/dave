@@ -1389,9 +1389,9 @@ if (bedDescriptor) {
 const pipBox = document.getElementById("pipBox");
 const pipLabel = document.getElementById("pipLabel");
 
-updateViewports();
-
-window.addEventListener("resize", () => updateViewports());
+// Defer initial viewport calc to next frame so the canvas has its
+// post-layout size (fonts/images can push layout after script runs).
+requestAnimationFrame(() => updateViewports());
 
 pipBox.addEventListener("click", () => {
   pipSwapped = !pipSwapped;
@@ -1615,7 +1615,14 @@ scene.onBeforeRenderObservable.add(() => {
 
 engine.runRenderLoop(() => scene.render());
 
-window.addEventListener("resize", () => engine.resize());
+window.addEventListener("resize", () => {
+  // Order matters: engine.resize() must run BEFORE updateViewports() so
+  // getRenderWidth/Height return the post-resize dimensions. Otherwise the
+  // PIP viewport rectangle uses stale dims while the CSS box uses the new
+  // aspect ratio, and the border desyncs from the rendered region.
+  engine.resize();
+  updateViewports();
+});
 
 // ── Session History UI ──────────────────────────────────────────────────
 
