@@ -20,20 +20,51 @@ export class DaveMindClient {
   }
 
   /**
-   * Browse the web while sitting at the computer
-   * Returns page title, reason, and response
+   * Fetch a Wikipedia article for Dave to read. With no args, picks a
+   * random article (session start). With { title }, fetches that specific
+   * article — used when Dave follows a link picked via browseChoose().
+   *
+   * Returns { pageTitle, reason, postContent, articleTitle, links, response }
+   * — `links` is the list of outbound article titles for the next hop.
    */
-  async browse() {
-    const data = await this._post({
+  async browse({ title } = {}) {
+    const body = {
       type: "browse",
       sessionId: this.sessionId,
       userId: this.userId,
-    });
-
+    };
+    if (title) body.title = title;
+    const data = await this._post(body);
     return {
       pageTitle: data.pageTitle || "Unknown Page",
+      articleTitle: data.articleTitle || "",
       reason: data.reason || "",
       postContent: data.postContent || "",
+      links: Array.isArray(data.links) ? data.links : [],
+      response: data.response || {},
+    };
+  }
+
+  /**
+   * Ask the backend to pick which outbound link Dave clicks next, given his
+   * current mood, the time of day, and the articles he's already read this
+   * session. Returns { choiceIndex, chosenTitle, reason, response } —
+   * chosenTitle is null if Dave declines all the options.
+   */
+  async browseChoose({ links, mood, hour, history } = {}) {
+    const data = await this._post({
+      type: "browse_choose",
+      sessionId: this.sessionId,
+      userId: this.userId,
+      links: Array.isArray(links) ? links : [],
+      mood: mood || "neutral",
+      hour: hour ?? new Date().getHours(),
+      history: Array.isArray(history) ? history : [],
+    });
+    return {
+      choiceIndex: data.choiceIndex ?? null,
+      chosenTitle: data.chosenTitle || null,
+      reason: data.reason || "",
       response: data.response || {},
     };
   }

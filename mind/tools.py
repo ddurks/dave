@@ -134,6 +134,41 @@ muse_tool = {
     },
 }
 
+browse_choose_tool = {
+    "type": "function",
+    "function": {
+        "name": "browse_choose",
+        "description": (
+            "Pick which outbound Wikipedia link D.A.V.E. clicks next, based on "
+            "his current mood, the time of day, and the titles available. May "
+            "decline to click any of them."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "choiceIndex": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "Zero-based index into the supplied `links` array. "
+                        "Use null to decline all the links (e.g., none of them "
+                        "fit the mood — Dave would just sit there instead)."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "One short sentence, in Dave's voice, explaining why "
+                        "he's clicking this one (or why he isn't clicking any). "
+                        "Will be shown as Dave's reaction before the page loads."
+                    ),
+                },
+                "emotion": {"type": "string", "enum": EMOTION_ENUM},
+            },
+            "required": ["choiceIndex", "reason", "emotion"],
+        },
+    },
+}
+
 
 # ── Helper ───────────────────────────────────────────────────────────────────
 

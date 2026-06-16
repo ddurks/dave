@@ -34,6 +34,14 @@ export class Beer {
       this.beerAggregate = null;
     }
 
+    // Run hand-attachment + physics sync AFTER animations evaluate but BEFORE
+    // the physics step. onBeforeRenderObservable (where dave.update lives) fires
+    // after the step has already happened this frame, which leaves the body
+    // pinned to last frame's mesh position — visible as drift during the chug.
+    this._prePhysicsObserver = scene.onBeforePhysicsObservable.add(() => {
+      this.updateBeerHandAttachment();
+    });
+
     // ── Particle System ──────────────────────────────────────────────────
     this.beerParticleInstances = [];
     this.beerEmitInterval = null;
@@ -64,6 +72,14 @@ export class Beer {
     this.beerPrevRot = new BABYLON.Quaternion();
     this._beerTmpMat = new BABYLON.Matrix();
     this._beerTmpRot = new BABYLON.Quaternion();
+
+    // Smooth-detach interpolation state. The chug animation's midpoint frame
+    // (where the detach callback fires during reverse) doesn't put the hand
+    // back at the keg — it's still up in the drink region. Snapping the beer
+    // straight to beerRestPos there is jarring, so we tween instead.
+    this._detachAnim = null;
+    this._detachLerpPos = new BABYLON.Vector3();
+    this._detachLerpRot = new BABYLON.Quaternion();
 
     // ── Constants ────────────────────────────────────────────────────────
     this.PARTICLE_DIAMETER_MIN = 0.05;
@@ -212,19 +228,45 @@ export class Beer {
     // Use right hand rotation as reference for beer orientation
     this.beerHandLocalRot = handQuatConj;
     this.beerAttached = true;
+    this._detachAnim = null;
   }
 
   /**
-   * Detach beer from hands and return to rest position
+   * Detach beer from hands and snap to rest position immediately.
+   * Used for resets and end-of-sequence cleanup.
    */
   detachBeer() {
     if (!this.beerGlassMesh) return;
 
     this.beerAttached = false;
+    this._detachAnim = null;
     this.beerGlassMesh.rotationQuaternion = null;
     this.beerGlassMesh.rotation = BABYLON.Vector3.Zero();
     this.beerGlassMesh.position.copyFrom(this.beerRestPos);
     this._syncPhysicsToMesh();
+  }
+
+  /**
+   * Detach beer and smoothly interpolate from current pose to rest pose.
+   * Used mid-reverse so the beer slides back to the keg instead of snapping.
+   */
+  detachBeerSmooth(durationMs = 350) {
+    if (!this.beerGlassMesh) return;
+
+    this.beerAttached = false;
+    const startRot = this.beerGlassMesh.rotationQuaternion
+      ? this.beerGlassMesh.rotationQuaternion.clone()
+      : BABYLON.Quaternion.Identity();
+    this._detachAnim = {
+      startTime: performance.now(),
+      duration: durationMs,
+      startPos: this.beerGlassMesh.position.clone(),
+      startRot,
+    };
+    // Ensure mesh has a quaternion to write to during the tween
+    if (!this.beerGlassMesh.rotationQuaternion) {
+      this.beerGlassMesh.rotationQuaternion = startRot.clone();
+    }
   }
 
   /**
@@ -292,6 +334,37 @@ export class Beer {
           this.beerHandLocalRot,
         );
       }
+    } else if (this._detachAnim && this.beerGlassMesh) {
+      const now = performance.now();
+      const raw = (now - this._detachAnim.startTime) / this._detachAnim.duration;
+      const t = raw >= 1 ? 1 : raw <= 0 ? 0 : raw;
+      const eased = t * t * (3 - 2 * t);
+
+      BABYLON.Vector3.LerpToRef(
+        this._detachAnim.startPos,
+        this.beerRestPos,
+        eased,
+        this._detachLerpPos,
+      );
+      this.beerGlassMesh.position.copyFrom(this._detachLerpPos);
+
+      BABYLON.Quaternion.SlerpToRef(
+        this._detachAnim.startRot,
+        BABYLON.Quaternion.Identity(),
+        eased,
+        this._detachLerpRot,
+      );
+      if (!this.beerGlassMesh.rotationQuaternion) {
+        this.beerGlassMesh.rotationQuaternion = BABYLON.Quaternion.Identity();
+      }
+      this.beerGlassMesh.rotationQuaternion.copyFrom(this._detachLerpRot);
+
+      if (t >= 1) {
+        this._detachAnim = null;
+        this.beerGlassMesh.rotationQuaternion = null;
+        this.beerGlassMesh.rotation = BABYLON.Vector3.Zero();
+        this.beerGlassMesh.position.copyFrom(this.beerRestPos);
+      }
     }
 
     // Always keep the physics body pinned to wherever the mesh is
@@ -310,7 +383,7 @@ export class Beer {
   }
 
   update() {
-    this.updateBeerHandAttachment();
+    // updateBeerHandAttachment runs on onBeforePhysicsObservable (see constructor)
     this.updateBeerParticles();
   }
 
@@ -338,10 +411,12 @@ export class Beer {
   }
 
   /**
-   * Callback to detach beer during reverse animation
+   * Callback to detach beer during reverse animation. Smooth so the beer
+   * eases back to the keg instead of snapping from wherever the hand was
+   * at the midpoint frame (which is still up in the drink region).
    */
   detachDuringReverseAnim() {
-    this.detachBeer();
+    this.detachBeerSmooth();
   }
 
   /**
@@ -350,6 +425,10 @@ export class Beer {
   dispose() {
     clearInterval(this.beerEmitInterval);
     this.cleanupBeerParticles();
+    if (this._prePhysicsObserver) {
+      this.scene.onBeforePhysicsObservable.remove(this._prePhysicsObserver);
+      this._prePhysicsObserver = null;
+    }
     if (this.beerAggregate) this.beerAggregate.dispose();
     this.beerLiquidMaterial.dispose();
     this.beerFoamMaterial.dispose();

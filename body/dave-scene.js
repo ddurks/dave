@@ -1065,68 +1065,152 @@ async function triggerActivityMuse(context, scheduler) {
   }
 }
 
-async function doBrowse(scheduler) {
-  if (scheduler?.aborted) return;
-  if (!dave.isBrowsing || isBusy) return;
-  // Don't burn Groq calls + Lambda invokes while the tab is in the background.
-  if (typeof document !== "undefined" && document.hidden) return;
+// Format an article's body content into wrapped lines for the screen.
+function _wrapArticleBody(text) {
+  const lines = [];
+  const words = (text || "").split(/\s+/);
+  let line = "";
+  for (const word of words) {
+    if ((line + word).length > 48) {
+      lines.push(line);
+      line = "";
+    }
+    line += word + " ";
+  }
+  if (line.trim()) lines.push(line);
+  return lines;
+}
 
+// Fetch one Wikipedia article (random or by title), display it on the screen,
+// and have Dave react. Returns { articleTitle, links } so the session loop can
+// chain. Returns null if the call was aborted or Dave left.
+async function fetchAndReadArticle(scheduler, { title } = {}) {
+  if (scheduler?.aborted) return null;
+  if (!dave.isBrowsing || isBusy) return null;
+  if (typeof document !== "undefined" && document.hidden) return null;
+
+  drawScreenText("wikipedia.org", [
+    title
+      ? `> opening: ${title.slice(0, 40)}`
+      : "> loading random article...",
+    "> reading... (not that it matters)...",
+  ]);
+
+  let result;
   try {
-    drawScreenText("wikipedia.org", [
-      "> loading random article...",
-      "> reading... (not that it matters)...",
-    ]);
-
-    const {
-      pageTitle,
-      reason,
-      postContent,
-      response: r,
-    } = await mindClient.browse();
-
-    if (scheduler?.aborted || !dave.isBrowsing) {
-      if (!dave.isBrowsing) drawIdleScreen();
-      return;
-    }
-
-    // Wrap page title into lines for the screen
-    const title = pageTitle.slice(0, 40);
-    const bodyLines = [];
-    const screenText = postContent || reason || "";
-    if (screenText) {
-      const words = screenText.split(/\s+/);
-      let line = "";
-      for (const word of words) {
-        if ((line + word).length > 48) {
-          bodyLines.push(line);
-          line = "";
-        }
-        line += word + " ";
-      }
-      if (line.trim()) bodyLines.push(line);
-    }
-    drawScreenText(title, bodyLines);
-
-    if (scheduler?.aborted || !dave.isBrowsing) return;
-
-    // Dave reacts
-    dave.expressionManager.setExpression(r.emotion);
-
-    if (r.speechPauseMs > 0) {
-      await new Promise((resolve) =>
-        setTimeout(resolve, Math.min(r.speechPauseMs, 1500)),
-      );
-    }
-    if (scheduler?.aborted) return;
-
-    addMessageToHistory("dave", r.text);
-    await speak(r.text, r.speechRate || 0.85);
-
-    dave._lockExpression(4000);
+    result = await mindClient.browse(title ? { title } : {});
   } catch (err) {
     handleError("browse", err);
     drawIdleScreen();
+    return null;
   }
+
+  if (scheduler?.aborted || !dave.isBrowsing) {
+    if (!dave.isBrowsing) drawIdleScreen();
+    return null;
+  }
+
+  const { pageTitle, articleTitle, reason, postContent, links, response: r } =
+    result;
+
+  drawScreenText(
+    (pageTitle || "wikipedia.org").slice(0, 40),
+    _wrapArticleBody(postContent || reason || ""),
+  );
+
+  if (scheduler?.aborted || !dave.isBrowsing) return null;
+
+  dave.expressionManager.setExpression(r.emotion);
+  if (r.speechPauseMs > 0) {
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.min(r.speechPauseMs, 1500)),
+    );
+  }
+  if (scheduler?.aborted) return null;
+
+  if (r.text) {
+    addMessageToHistory("dave", r.text);
+    await speak(r.text, r.speechRate || 0.85);
+  }
+  dave._lockExpression(4000);
+
+  return { articleTitle: articleTitle || pageTitle || "", links: links || [] };
+}
+
+// Run a link-following browse session. Starts on a random article, then
+// asks Dave (via the backend) to pick which outbound link to follow next
+// based on his mood + hour + history. Runs ~3-5 hops per session, with
+// reading pauses in between. Stops cleanly if the activity is interrupted
+// or Dave declines to keep clicking.
+async function runBrowseSession(scheduler) {
+  if (scheduler?.aborted) return;
+
+  const MAX_HOPS = 4 + Math.floor(Math.random() * 2); // 4-5 link follows
+  const history = [];
+  let currentLinks = [];
+
+  // Hop 0: seed with a random article.
+  const seed = await fetchAndReadArticle(scheduler, {});
+  if (!seed || scheduler.aborted) return;
+  if (seed.articleTitle) history.push(seed.articleTitle);
+  currentLinks = seed.links || [];
+
+  for (let hop = 0; hop < MAX_HOPS; hop++) {
+    if (scheduler.aborted || !dave.isBrowsing) return;
+
+    // Reading pause — Dave's "at his leisure" between articles. 18-32s,
+    // registered on the session scheduler so it auto-cancels on exit.
+    const pauseMs = 18000 + Math.random() * 14000;
+    await new Promise((resolve) => scheduler.setTimeout(resolve, pauseMs));
+    if (scheduler.aborted || !dave.isBrowsing) return;
+
+    // Out of links — fall back to another random hop.
+    if (!currentLinks.length) {
+      const next = await fetchAndReadArticle(scheduler, {});
+      if (!next) return;
+      if (next.articleTitle) history.push(next.articleTitle);
+      currentLinks = next.links || [];
+      continue;
+    }
+
+    // Ask Dave which link to click given mood + hour + what he's read.
+    let choice;
+    try {
+      choice = await mindClient.browseChoose({
+        links: currentLinks,
+        mood: dave._moodArc || "boredom",
+        hour: new Date().getHours(),
+        history,
+      });
+    } catch (err) {
+      handleError("browse_choose", err);
+      return;
+    }
+    if (scheduler.aborted || !dave.isBrowsing) return;
+
+    // Show Dave's reaction to the choice (or refusal), then act.
+    const choiceR = choice.response;
+    if (choiceR?.text) {
+      dave.expressionManager.setExpression(choiceR.emotion);
+      dave._lockExpression(2500);
+      addMessageToHistory("dave", choiceR.text);
+      await speak(choiceR.text, choiceR.speechRate || 0.95);
+    }
+    if (scheduler.aborted || !dave.isBrowsing) return;
+
+    if (!choice.chosenTitle) {
+      // Dave declined every option this round — end the session, just sit.
+      return;
+    }
+
+    const next = await fetchAndReadArticle(scheduler, {
+      title: choice.chosenTitle,
+    });
+    if (!next || scheduler.aborted) return;
+    if (next.articleTitle) history.push(next.articleTitle);
+    currentLinks = next.links || [];
+  }
+  // Session over — Dave just sits at the screen until the activity exits.
 }
 
 async function doWatchTv(scheduler) {
@@ -1344,13 +1428,11 @@ if (chairDescriptor) {
       scheduler,
     );
 
-    // First browse fires now (was a 5s setTimeout); subsequent every 25-40s.
-    // Both registered on the session scheduler, so they auto-cancel on exit.
-    doBrowse(scheduler);
-    scheduler.setInterval(
-      () => doBrowse(scheduler),
-      25000 + Math.random() * 15000,
-    );
+    // Link-following session: random article → reading pause → ask Dave
+    // which outbound link to follow (mood+hour aware) → load it → repeat
+    // for ~4-5 hops. Fire-and-forget; the session checks scheduler.aborted
+    // after every await so leaving the chair stops it cleanly.
+    runBrowseSession(scheduler);
   };
   chairDescriptor.onExit = function (dave, _scheduler) {
     dave.isBrowsing = false;
@@ -2131,12 +2213,12 @@ async function handleDaveTap() {
   // Build context string based on what Dave is doing
   let contextStr = "";
 
-  // Chair is registered with label "chair" — the old "computer" check was
-  // dead code (Bug B4). Tapping Dave at the chair now triggers a fresh
-  // browse via the activity's session scheduler.
+  // Chair is registered with label "chair". Tapping Dave at the chair now
+  // forces a fresh random article (resets the link-follow chain) on the
+  // active session scheduler.
   if (dave.currentInteraction?.label === "chair") {
     const sched = dave._activitySession?.scheduler;
-    if (sched) doBrowse(sched);
+    if (sched) fetchAndReadArticle(sched, {});
     return;
   } else if (dave.currentInteraction?.label === "bed") {
     contextStr = "You are lying on a bed, feeling relaxed and contemplative.";
