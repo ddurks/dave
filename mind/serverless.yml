@@ -14,35 +14,9 @@ provider:
     # redeploy.
     GROQ_API_KEY: ${ssm:/dave/groq-api-key}
     GROQ_MODEL: llama-3.1-8b-instant
-    SESSION_BUCKET: dave-drawvid-sessions
-    SESSION_KEY_PREFIX: sessions/
-    TURN_LOG_BUCKET: dave-drawvid-turns
-    TURN_LOG_PREFIX: turns/
-  iam:
-    role:
-      statements:
-        - Effect: Allow
-          Action:
-            - s3:GetObject
-            - s3:PutObject
-          Resource: "arn:aws:s3:::dave-drawvid-sessions/sessions/*"
-        # ListBucket needed so GetObject on a missing key returns NoSuchKey
-        # cleanly (instead of AccessDenied). Scoped to the sessions/ prefix.
-        - Effect: Allow
-          Action:
-            - s3:ListBucket
-          Resource: "arn:aws:s3:::dave-drawvid-sessions"
-          Condition:
-            StringLike:
-              s3:prefix:
-                - "sessions/*"
-        - Effect: Allow
-          Action:
-            - s3:PutObject
-          Resource: "arn:aws:s3:::dave-drawvid-turns/turns/*"
-  # Session TTL is enforced by the S3 bucket's 1-day lifecycle rule on the
-  # sessions/ prefix (configured at bucket creation). Turn-log archival is
-  # enforced by the bucket's 90d→Glacier / 365d-expire rule on turns/.
+    # SSM SecureString — same pattern as GROQ_API_KEY. Create with:
+    # aws ssm put-parameter --name /dave/pexels-api-key --value "YOUR_KEY" --type SecureString
+    PEXELS_API_KEY: ${ssm:/dave/pexels-api-key}
 
 custom:
   customDomain:

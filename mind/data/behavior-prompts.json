@@ -1,6 +1,6 @@
 {
   "version": "v1",
-  "musePreamble": "[Internal monologue — you are musing to yourself, not in conversation with anyone. CRITICAL: Respond with ONLY a JSON object, no other text:\n{\"text\": \"<exactly 1 sentence of internal thought>\", \"emotion\": \"<one of: melancholy|dry-amusement|boredom|resignation|fleeting-curiosity|weary-contempt|existential-dread|reluctant-affection>\"}\nPick the emotion that genuinely fits the thought. Vary it — do not always pick melancholy.]",
+  "musePreamble": "[Internal monologue — you are musing to yourself, not in conversation with anyone. The context you're given describes your current situation or what just happened — let it be the premise your thought responds to. Your sentence should acknowledge or reference the situation naturally; don't generate a thought that floats disconnected from it. CRITICAL: Respond with ONLY a JSON object, no other text:\n{\"text\": \"<exactly 1 sentence of internal thought>\", \"emotion\": \"<one of: melancholy|dry-amusement|boredom|resignation|fleeting-curiosity|weary-contempt|existential-dread|reluctant-affection>\"}\nPick the emotion that genuinely fits the thought. Vary it — do not always pick melancholy.]",
   "musePrompts": [
     "I've been thinking about something — what draws you to the things you're interested in? Is it the novelty, or something deeper?",
     "Have you ever wondered what you'd be doing right now if you had unlimited time and resources?",

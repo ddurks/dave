@@ -4,7 +4,8 @@
 import cfg from "./src/config.js";
 import { DaveMindClient } from "./src/dave-mind-client.js";
 import { handleError, clamp, normalizeAngle } from "./src/utils.js";
-import { Dave } from "./src/dave-character.js";
+import { Dave, S } from "./src/dave-character.js";
+import Activity from "./src/dave-activity.js";
 import { CamCharacter, Screen, Lamp } from "./src/dave-enclosure.js";
 
 // ── Application Constants ───────────────────────────────────────────────────
@@ -555,6 +556,17 @@ function getEnclosureMeshesByKeyword(keyword) {
   );
 }
 
+// Default durations chosen to feel like Dave is "actually doing" the activity
+// without parking him forever. Capped further on the Dave side via the
+// Activity's maxDuration — see dave-character.js _capDuration.
+const ACTIVITY_DEFAULTS = {
+  chair:    { defaultDuration: 75,  maxDuration: 180, anim: "sit" },
+  computer: { defaultDuration: 75,  maxDuration: 180, anim: "sit" },
+  couch:    { defaultDuration: 90,  maxDuration: 180, anim: "sit" },
+  bed:      { defaultDuration: 120, maxDuration: 240, anim: "laydown" },
+  keg:      { defaultDuration: 45,  maxDuration: 90,  anim: "idle" },
+};
+
 function buildSitDescriptor(mesh, label) {
   if (!mesh) return null;
   mesh.computeWorldMatrix(true);
@@ -593,17 +605,24 @@ function buildSitDescriptor(mesh, label) {
   const facingAngle =
     Math.atan2(furnitureForward.x, furnitureForward.z) + MODEL_FORWARD_OFFSET;
 
-  return {
-    mesh,
+  const defaults = ACTIVITY_DEFAULTS[label] || {
+    defaultDuration: 60,
+    maxDuration: 180,
+    anim: "sit",
+  };
+
+  return new Activity({
     label,
+    mesh,
     approachPos,
     departPos,
     facingAngle,
-    onArrive() {
-      // Animation handled by Dave.updateBehavior()
-    },
-    onDepart() {},
-  };
+    anim: defaults.anim,
+    blocksHead: true,
+    reversible: defaults.anim !== "idle",
+    defaultDuration: defaults.defaultDuration,
+    maxDuration: defaults.maxDuration,
+  });
 }
 
 // Register chair (+ computer desk browsing) & couch
@@ -613,18 +632,11 @@ const couchMesh = findEnclosureMesh("couch");
 const chairDescriptor = buildSitDescriptor(chairMesh, "chair");
 const couchDescriptor = buildSitDescriptor(couchMesh, "couch");
 
-// Chair triggers browsing when Dave sits down
+// Chair / computer / desk are clickable aliases for the same Activity.
+// onEnter/onExit are wired below after Dave is constructed (they need
+// closures over mindClient, drawScreenText, addMessageToHistory, etc.).
 if (chairDescriptor) {
-  chairDescriptor.onArrive = () => {
-    // Browsing UI will be initialized later when Dave exists
-    // (see wire-up after Dave instantiation)
-  };
-  chairDescriptor.onDepart = () => {
-    // Browsing UI will be stopped later when Dave exists
-    // (see wire-up after Dave instantiation)
-  };
   registerInteractable(chairDescriptor);
-  // Also register computer + desk meshes as clickable aliases for the chair
   const computerMesh = findEnclosureMesh("computer");
   const deskMesh = findEnclosureMesh("desk");
   [computerMesh, deskMesh].forEach((m) => {
@@ -679,10 +691,7 @@ if (bedDescriptor) {
     bedCenter.z + bedLeft.z * 2.0,
   );
 
-  // Override onArrive - animation handled by Dave.updateBehavior()
-  bedDescriptor.onArrive = () => {
-    // Animation handled by Dave.updateBehavior()
-  };
+  // onEnter wired below after Dave is constructed.
   registerInteractable(bedDescriptor);
   // Register ALL bed-related meshes so clicking any part works
   getEnclosureMeshesByKeyword("bed").forEach((m) => {
@@ -715,9 +724,9 @@ if (kegMesh) {
   const kegFacingAngle =
     Math.atan2(-kegFwd.x, -kegFwd.z) + MODEL_FORWARD_OFFSET;
 
-  kegDescriptor = {
-    mesh: kegMesh,
+  kegDescriptor = new Activity({
     label: "keg",
+    mesh: kegMesh,
     approachPos: kegApproach,
     departPos: new BABYLON.Vector3(
       kegCenter.x + kegFwd.x * 2.8,
@@ -725,12 +734,12 @@ if (kegMesh) {
       kegCenter.z + kegFwd.z * 2.8,
     ),
     facingAngle: kegFacingAngle,
-    onArrive() {
-      // Animation handled by Dave.updateBehavior()
-      // Beer sequence is also triggered automatically in Dave.updateBehavior()
-    },
-    onDepart() {},
-  };
+    anim: "idle", // beer sequence overrides currentAction to "chug" mid-sequence
+    blocksHead: true,
+    reversible: false,
+    defaultDuration: ACTIVITY_DEFAULTS.keg.defaultDuration,
+    maxDuration: ACTIVITY_DEFAULTS.keg.maxDuration,
+  });
 
   registerInteractable(kegDescriptor);
 
@@ -758,6 +767,178 @@ if (bedDescriptor) furnitureByName["bed"] = bedDescriptor;
 if (kegDescriptor) furnitureByName["keg"] = kegDescriptor;
 if (kegDescriptor) furnitureByName["kegerator"] = kegDescriptor;
 if (kegDescriptor) furnitureByName["beer"] = kegDescriptor;
+
+// ── TV Video Texture ──────────────────────────────────────────────────
+const tvMesh = findEnclosureMesh("tv");
+const tvOriginalMaterial = tvMesh?.material ?? null;
+const TV_TEX_SIZE = 1024;
+let tvVideoElement = null; // HTMLVideoElement for cleanup
+let tvVideoObserver = null; // render-loop observer for canvas updates
+let tvVideoTexture = null; // DynamicTexture driven by video frames
+let tvImageTexture = null; // DynamicTexture for user-uploaded images
+let tvUserMediaActive = false;
+
+// Override the TV mesh's UVs so the texture maps 1:1 onto the screen face.
+// Blender exports them rotated and offset, which meant our canvas content
+// (centered, fit-to-screen) appeared zoomed and cropped on the TV — see the
+// "steelworkers" diagnostic. Computing UVs from vertex positions on the
+// mesh's largest planar face guarantees a clean (0,0)→(1,1) mapping.
+function _normalizeTvMeshUVs(mesh) {
+  if (!mesh) return;
+  const positions = mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind);
+  if (!positions || positions.length < 12) return;
+
+  // Bounds in local mesh space — used to pick the two largest axes (the
+  // "face" of the TV) and to scale UVs from 0 to 1 across that face.
+  let xMin = Infinity, xMax = -Infinity;
+  let yMin = Infinity, yMax = -Infinity;
+  let zMin = Infinity, zMax = -Infinity;
+  for (let i = 0; i < positions.length; i += 3) {
+    const x = positions[i], y = positions[i + 1], z = positions[i + 2];
+    if (x < xMin) xMin = x; if (x > xMax) xMax = x;
+    if (y < yMin) yMin = y; if (y > yMax) yMax = y;
+    if (z < zMin) zMin = z; if (z > zMax) zMax = z;
+  }
+  const dx = xMax - xMin || 1;
+  const dy = yMax - yMin || 1;
+  const dz = zMax - zMin || 1;
+
+  // The flat face axis is whichever has the smallest extent.
+  const smallest = Math.min(dx, dy, dz);
+  let uAxis, vAxis, uMin, vMin, uRange, vRange;
+  if (smallest === dz) {
+    uAxis = 0; vAxis = 1; uMin = xMin; vMin = yMin; uRange = dx; vRange = dy;
+  } else if (smallest === dx) {
+    uAxis = 2; vAxis = 1; uMin = zMin; vMin = yMin; uRange = dz; vRange = dy;
+  } else {
+    uAxis = 0; vAxis = 2; uMin = xMin; vMin = zMin; uRange = dx; vRange = dz;
+  }
+
+  const vertexCount = positions.length / 3;
+  const uvs = new Float32Array(vertexCount * 2);
+  for (let i = 0; i < vertexCount; i++) {
+    const p = i * 3;
+    uvs[i * 2] = (positions[p + uAxis] - uMin) / uRange;
+    uvs[i * 2 + 1] = (positions[p + vAxis] - vMin) / vRange;
+  }
+  mesh.setVerticesData(BABYLON.VertexBuffer.UVKind, uvs);
+}
+_normalizeTvMeshUVs(tvMesh);
+
+function _setTvMaterial(tex) {
+  // Since _normalizeTvMeshUVs reset the mesh's UVs to a clean (0,0)→(1,1)
+  // mapping, the texture transform stays at identity — no rotation, no
+  // scale, no offset.
+  tex.uOffset = 0;
+  tex.vOffset = 0;
+  tex.uScale = 1;
+  tex.vScale = 1;
+  tex.uAng = 0;
+  tex.vAng = 0;
+  tex.wAng = 0;
+
+  const mat = new BABYLON.StandardMaterial("tvVideoMat", scene);
+  mat.diffuseColor = BABYLON.Color3.Black();
+  mat.emissiveTexture = tex;
+  mat.backFaceCulling = false;
+  tvMesh.material = mat;
+}
+
+// Draw src (video or image) letterboxed/pillarboxed into the square canvas,
+// centered. Aspect ratio preserved — landscape sources get black bars on
+// top/bottom; portrait sources get bars on left/right.
+function _drawContain(ctx, src, srcW, srcH) {
+  ctx.fillStyle = "black";
+  ctx.fillRect(0, 0, TV_TEX_SIZE, TV_TEX_SIZE);
+
+  const scale = Math.min(TV_TEX_SIZE / srcW, TV_TEX_SIZE / srcH);
+  const drawW = srcW * scale;
+  const drawH = srcH * scale;
+  const drawX = (TV_TEX_SIZE - drawW) / 2;
+  const drawY = (TV_TEX_SIZE - drawH) / 2;
+  ctx.drawImage(src, drawX, drawY, drawW, drawH);
+}
+
+function applyVideoToTv(videoUrl) {
+  if (!tvMesh) return;
+  clearTvVideo();
+  const video = document.createElement("video");
+  video.crossOrigin = "anonymous"; // must be set before .src
+  video.muted = true;
+  video.loop = true;
+  video.playsInline = true;
+  video.src = videoUrl;
+  tvVideoElement = video;
+
+  const dynTex = new BABYLON.DynamicTexture(
+    "tvVideoTex",
+    { width: TV_TEX_SIZE, height: TV_TEX_SIZE },
+    scene,
+    false,
+  );
+  tvVideoTexture = dynTex;
+  const ctx = dynTex.getContext();
+
+  tvVideoObserver = scene.onBeforeRenderObservable.add(() => {
+    if (video.readyState >= 2) {
+      _drawContain(
+        ctx,
+        video,
+        video.videoWidth || TV_TEX_SIZE,
+        video.videoHeight || TV_TEX_SIZE,
+      );
+      dynTex.update();
+    }
+  });
+
+  video.play().catch(() => {});
+  _setTvMaterial(dynTex);
+}
+
+function clearTvVideo() {
+  if (!tvMesh) return;
+  if (tvVideoObserver) {
+    scene.onBeforeRenderObservable.remove(tvVideoObserver);
+    tvVideoObserver = null;
+  }
+  if (tvVideoElement) {
+    tvVideoElement.pause();
+    tvVideoElement.src = "";
+    tvVideoElement = null;
+  }
+  if (tvVideoTexture) {
+    tvVideoTexture.dispose();
+    tvVideoTexture = null;
+  }
+  if (tvImageTexture) {
+    tvImageTexture.dispose();
+    tvImageTexture = null;
+  }
+  if (tvMesh.material?.name === "tvVideoMat") {
+    tvMesh.material.dispose();
+    tvMesh.material = tvOriginalMaterial;
+  }
+}
+
+function applyImageToTv(dataUrl) {
+  if (!tvMesh) return;
+  clearTvVideo();
+  const dynTex = new BABYLON.DynamicTexture(
+    "tvImageTex",
+    { width: TV_TEX_SIZE, height: TV_TEX_SIZE },
+    scene,
+    false,
+  );
+  const img = new Image();
+  img.onload = () => {
+    _drawContain(dynTex.getContext(), img, img.naturalWidth, img.naturalHeight);
+    dynTex.update();
+    URL.revokeObjectURL(dataUrl);
+  };
+  img.src = dataUrl;
+  tvImageTexture = dynTex;
+  _setTvMaterial(dynTex);
+}
 
 // ── Computer Screen DynamicTexture ─────────────────────────────────────
 const screenMesh =
@@ -854,12 +1035,39 @@ function drawIdleScreen() {
 }
 drawIdleScreen();
 
-// ── Browsing System ────────────────────────────────────────────────────
-let isBrowsing = false;
-let browseInterval = null;
+// ── Activity Behavior Helpers ──────────────────────────────────────────
+// These are called from the Activity onEnter hooks (wired up after Dave is
+// constructed). Each takes a `scheduler` scoped to the current activity
+// session — every timer they register, and every async resume, checks
+// `scheduler.aborted` so late callbacks fired after Dave moved on become
+// no-ops automatically.
 
-async function doBrowse() {
-  if (!isBrowsing || isBusy) return;
+async function triggerActivityMuse(context, scheduler) {
+  // Activity muse runs in parallel with the activity itself — it sets an
+  // expression and speaks, but never gates the activity's primary feedback
+  // (e.g., the chair's screen draw fires immediately, not after the muse).
+  // We still use dave.isMusing so the spontaneous-muse ticks don't pile up.
+  if (!dave || dave.isMusing) return;
+  if (typeof document !== "undefined" && document.hidden) return;
+  dave.isMusing = true;
+  try {
+    const { response: r } = await mindClient.muse(context);
+    if (scheduler?.aborted) return;
+    if (!r?.text) return;
+    dave.expressionManager.setExpression(r.emotion);
+    dave._lockExpression(3000);
+    addMessageToHistory("dave", r.text);
+    await speak(r.text, r.speechRate || 0.85);
+  } catch {
+    // silent
+  } finally {
+    dave.isMusing = false;
+  }
+}
+
+async function doBrowse(scheduler) {
+  if (scheduler?.aborted) return;
+  if (!dave.isBrowsing || isBusy) return;
   // Don't burn Groq calls + Lambda invokes while the tab is in the background.
   if (typeof document !== "undefined" && document.hidden) return;
 
@@ -869,18 +1077,21 @@ async function doBrowse() {
       "> reading... (not that it matters)...",
     ]);
 
-    const { pageTitle, reason, postContent, response: r } = await mindClient.browse();
+    const {
+      pageTitle,
+      reason,
+      postContent,
+      response: r,
+    } = await mindClient.browse();
 
-    if (!isBrowsing) {
-      drawIdleScreen();
+    if (scheduler?.aborted || !dave.isBrowsing) {
+      if (!dave.isBrowsing) drawIdleScreen();
       return;
     }
 
     // Wrap page title into lines for the screen
     const title = pageTitle.slice(0, 40);
     const bodyLines = [];
-
-    // Show the actual post content Dave is reading
     const screenText = postContent || reason || "";
     if (screenText) {
       const words = screenText.split(/\s+/);
@@ -894,10 +1105,9 @@ async function doBrowse() {
       }
       if (line.trim()) bodyLines.push(line);
     }
-
     drawScreenText(title, bodyLines);
 
-    if (!isBrowsing) return;
+    if (scheduler?.aborted || !dave.isBrowsing) return;
 
     // Dave reacts
     dave.expressionManager.setExpression(r.emotion);
@@ -907,8 +1117,8 @@ async function doBrowse() {
         setTimeout(resolve, Math.min(r.speechPauseMs, 1500)),
       );
     }
+    if (scheduler?.aborted) return;
 
-    showSpeechBubble(r.text);
     addMessageToHistory("dave", r.text);
     await speak(r.text, r.speechRate || 0.85);
 
@@ -919,35 +1129,37 @@ async function doBrowse() {
   }
 }
 
-function startBrowsing() {
-  isBrowsing = true;
-  drawScreenText("wikipedia.org", [
-    "> opening wikipedia...",
-    "> motivation level: minimal",
-  ]);
-  // First browse after a short delay
-  setTimeout(() => {
-    if (isBrowsing) doBrowse();
-  }, 2000);
-  // Then browse every 25-40 seconds. Clear any orphan from a prior
-  // onArrive that didn't get its onDepart (e.g. LLM-driven moveTo while
-  // Dave was already at the chair).
-  if (browseInterval) clearInterval(browseInterval);
-  browseInterval = setInterval(
-    () => {
-      if (isBrowsing) doBrowse();
-    },
-    25000 + Math.random() * 15000,
-  );
-}
+async function doWatchTv(scheduler) {
+  if (scheduler?.aborted) return;
+  if (!dave.isWatchingTv || isBusy) return;
+  if (tvUserMediaActive) return;
+  if (typeof document !== "undefined" && document.hidden) return;
 
-function stopBrowsing() {
-  isBrowsing = false;
-  if (browseInterval) {
-    clearInterval(browseInterval);
-    browseInterval = null;
+  try {
+    const { videoUrl, response: r } = await mindClient.watchTv();
+
+    if (scheduler?.aborted || !dave.isWatchingTv) return;
+
+    if (videoUrl) applyVideoToTv(videoUrl);
+
+    if (!r) return; // no signal — just play the video silently
+
+    dave.expressionManager.setExpression(r.emotion);
+
+    if (r.speechPauseMs > 0) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(r.speechPauseMs, 1500)),
+      );
+    }
+    if (scheduler?.aborted) return;
+
+    addMessageToHistory("dave", r.text);
+    await speak(r.text, r.speechRate || 0.85);
+
+    dave._lockExpression(4000);
+  } catch (err) {
+    handleError("watchtv", err);
   }
-  drawIdleScreen();
 }
 
 // ── Dave Physics Capsule ─────────────────────────────────────────────────
@@ -990,8 +1202,19 @@ root.position = new BABYLON.Vector3(0, -DAVE_CAPSULE_HEIGHT / 2, 0);
 
 // LLM/API Abstraction ────────────────────────────────────────────────
 // Call the backend API to generate responses
+function _buildChatHistory(limit = 20) {
+  return sessionMessages
+    .filter((m) => m.sender === "user" || m.sender === "dave")
+    .slice(-limit)
+    .map((m) => ({
+      role: m.sender === "dave" ? "assistant" : "user",
+      content: m.text,
+    }));
+}
+
 async function generateDaveResponse(userInput) {
-  const response = await mindClient.respond(userInput);
+  const history = _buildChatHistory();
+  const response = await mindClient.respond(userInput, history);
   DaveMindClient.logInteraction("respond", {
     emotion: response?.emotion,
     text: response?.text?.substring(0, 50).replace(/\n/g, " ") + "...",
@@ -1084,19 +1307,82 @@ const dave = new Dave(
 // Store dave reference for keyboard handlers (e.g., grid visualization)
 window._dave = dave;
 
+// ── Mutter Callback ───────────────────────────────────────────────────────
+// Dave fires passive speech (linger notices, directive grumbles) through here.
+dave.onMutter = async (text) => {
+  if (!text || isBusy || dave.isMusing) return;
+  addMessageToHistory("dave", text);
+  await speak(text, 0.95);
+};
+
 // ── Wire up browsing callbacks to Dave instance ───────────────────────────
 // Update chair descriptor callbacks now that Dave exists
 // These callbacks handle both UI (screen setup, intervals) and Dave gaze behavior
+
+// ── Activity Lifecycle Wiring ──────────────────────────────────────────
+// Each furniture's Activity now owns its own browse/TV loop via the
+// per-session Scheduler passed to onEnter. Replaces the old
+// skipBrowseOnArrive / skipWatchTvOnArrive flag system: user-driven flows
+// (submitUrl, submitMedia) build a one-off "passive" Activity for the same
+// furniture, which has no auto-loop. The cleanup is automatic — when Dave
+// leaves the activity, the Scheduler cancels every timer it set up, so
+// there's no orphan-interval class of bug to manage.
+
 if (chairDescriptor) {
-  chairDescriptor.onArrive = () => {
+  chairDescriptor.onEnter = function (dave, scheduler) {
+    // Visible feedback fires IMMEDIATELY — no 5s gate, no muse-blocking.
+    drawScreenText("wikipedia.org", [
+      "> opening wikipedia...",
+      "> motivation level: minimal",
+    ]);
     dave.isBrowsing = true;
-    // UI: Initialize browser screen and start browse interval
-    startBrowsing();
+
+    // Activity muse runs in parallel — it can speak afterward but doesn't
+    // delay the screen draw or the first browse.
+    triggerActivityMuse(
+      "You just sat down at the computer and opened Wikipedia.",
+      scheduler,
+    );
+
+    // First browse fires now (was a 5s setTimeout); subsequent every 25-40s.
+    // Both registered on the session scheduler, so they auto-cancel on exit.
+    doBrowse(scheduler);
+    scheduler.setInterval(
+      () => doBrowse(scheduler),
+      25000 + Math.random() * 15000,
+    );
   };
-  chairDescriptor.onDepart = () => {
+  chairDescriptor.onExit = function (dave, _scheduler) {
     dave.isBrowsing = false;
-    // UI: Stop browser interval and show idle screen
-    stopBrowsing();
+    drawIdleScreen();
+  };
+}
+
+if (couchDescriptor) {
+  couchDescriptor.onEnter = function (dave, scheduler) {
+    dave.isWatchingTv = true;
+    triggerActivityMuse(
+      "You just settled onto the couch and turned on the TV.",
+      scheduler,
+    );
+
+    // First video fetch fires now; subsequent every 60-90s. Auto-cancelled.
+    doWatchTv(scheduler);
+    scheduler.setInterval(
+      () => doWatchTv(scheduler),
+      60000 + Math.random() * 30000,
+    );
+  };
+  couchDescriptor.onExit = function (dave, _scheduler) {
+    dave.isWatchingTv = false;
+    tvUserMediaActive = false;
+    clearTvVideo();
+  };
+}
+
+if (bedDescriptor) {
+  bedDescriptor.onEnter = function (_dave, scheduler) {
+    triggerActivityMuse("You just lay down on the bed.", scheduler);
   };
 }
 
@@ -1112,7 +1398,7 @@ pipBox.addEventListener("click", () => {
   // Swap which camera has orbit controls
   if (pipSwapped) {
     camera.detachControl();
-    pipLabel.textContent = "Orbital Camera";
+    pipLabel.textContent = "C.A.M.";
   } else {
     camera.attachControl(canvas, true);
     pipLabel.textContent = "Dave Gaze";
@@ -1131,25 +1417,7 @@ pipBox.addEventListener("click", () => {
 
 function speak(text, rate) {
   return new Promise((resolve) => {
-    // If muted, skip speech synthesis but still do lip sync
-    if (isMuted) {
-      dave.expressionManager.startLipSync(text);
-      const durationMs = (text.length * 60) / rate;
-      const msPerChar = durationMs / Math.max(text.length, 1);
-      for (let i = 0; i < text.length; i++) {
-        setTimeout(
-          () => (dave.expressionManager.speechCharIndex = i),
-          i * msPerChar,
-        );
-      }
-      setTimeout(() => {
-        dave.expressionManager.stopLipSync();
-        resolve();
-      }, durationMs);
-      return;
-    }
-
-    if (!("speechSynthesis" in window)) {
+    if (isMuted || !("speechSynthesis" in window)) {
       dave.expressionManager.startLipSync(text);
       const durationMs = (text.length * 60) / rate;
       const msPerChar = durationMs / Math.max(text.length, 1);
@@ -1258,11 +1526,6 @@ speechRect.addControl(speechBubble);
 speechRect.linkWithMesh(dave.headNode);
 speechRect.linkOffsetY = bubbleOffsetY;
 
-function showSpeechBubble(text) {
-  // Messages now display only in session history, not as overhead bubbles
-  // This function is kept for compatibility but does nothing
-}
-
 // ── User Awareness ───────────────────────────────────────────────────────
 
 let userLingerTimer = 60 + Math.random() * 30; // First linger glance after 60-90s
@@ -1271,8 +1534,26 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     dave.onUserDepart();
   } else {
+    // Capture neglect phase before onUserArrive clears _tabHiddenAt
+    const neglectPhase = dave._getNeglectPhase();
     dave.onUserArrive();
     userLingerTimer = 45 + Math.random() * 30;
+    if (neglectPhase >= 1) {
+      const ctxStr =
+        neglectPhase >= 2
+          ? "The user has been gone for a very long time. React to their return with deep weariness."
+          : "The user just came back after being away for a while. React to their return.";
+      setTimeout(() => {
+        if (!isBusy && !dave.isMusing) {
+          dave.triggerMuse(ctxStr).then((r) => {
+            if (r?.text) {
+              addMessageToHistory("dave", r.text);
+              speak(r.text, 1.0);
+            }
+          });
+        }
+      }, 2000);
+    }
   }
 });
 
@@ -1294,8 +1575,14 @@ scene.onBeforeRenderObservable.add(() => {
     }
   }
 
-  // Update Dave character (animations, expressions, movement, gaze, etc.)
-  dave.update(dt);
+  // Update Dave character (animations, expressions, movement, gaze, etc.).
+  // Wrapped in try/catch so a Dave tick throw can't take CAM's blink and
+  // the camera follow logic offline alongside it.
+  try {
+    dave.update(dt);
+  } catch (e) {
+    handleError("dave.update", e);
+  }
 
   // Camera follows D.A.V.E.
   cameraTarget.x +=
@@ -1314,7 +1601,11 @@ scene.onBeforeRenderObservable.add(() => {
         Math.atan2(camDir.x, camDir.z) + MODEL_FORWARD_OFFSET;
     }
   }
-  camCharacter.update(dt, cameraTarget, camera.position);
+  try {
+    camCharacter.update(dt, cameraTarget, camera.position);
+  } catch (e) {
+    handleError("camCharacter.update", e);
+  }
 
   // Prevent camera from going below ground
   if (camera.position.y < cfg.CAMERA.MIN_HEIGHT) {
@@ -1449,11 +1740,230 @@ historyTab.addEventListener("click", () => {
 
 const chatInput = document.getElementById("chatInput");
 const sendBtn = document.getElementById("sendBtn");
+const attachBtn = document.getElementById("attachBtn");
+const fileInput = document.getElementById("fileInput");
 let isBusy = false;
+
+// ── URL & Media Submission Helpers ─────────────────────────────────────
+
+async function fileToResizedBase64(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      const MAX = 512;
+      const scale = Math.min(MAX / img.width, MAX / img.height, 1);
+      const w = Math.max(1, Math.round(img.width * scale));
+      const h = Math.max(1, Math.round(img.height * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL("image/jpeg", 0.7));
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("image load failed"));
+    };
+    img.src = url;
+  });
+}
+
+async function extractVideoFrame(objectUrl) {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.onloadedmetadata = () => {
+      video.currentTime = Math.min(1, video.duration * 0.1);
+    };
+    video.onseeked = () => {
+      const vw = video.videoWidth || 512;
+      const vh = video.videoHeight || 512;
+      const MAX = 512;
+      const scale = Math.min(MAX / vw, MAX / vh, 1);
+      const w = Math.max(1, Math.round(vw * scale));
+      const h = Math.max(1, Math.round(vh * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext("2d").drawImage(video, 0, 0, w, h);
+      video.src = "";
+      resolve(canvas.toDataURL("image/jpeg", 0.7));
+    };
+    video.onerror = reject;
+    video.src = objectUrl;
+  });
+}
+
+// Build a one-shot Activity at the same position as `template` but with no
+// auto-loop — used for user-driven flows (URL submission, media upload) that
+// manage screen / TV content directly. Replaces the old skipBrowseOnArrive
+// stale-flag system.
+function makePassiveSeat(template, { onEnter, onExit } = {}) {
+  const passive = new Activity({
+    label: template.label,
+    mesh: template.mesh,
+    approachPos: template.approachPos,
+    departPos: template.departPos,
+    facingAngle: template.facingAngle,
+    anim: template.anim,
+    blocksHead: template.blocksHead,
+    reversible: template.reversible,
+    defaultDuration: template.defaultDuration,
+    maxDuration: template.maxDuration,
+  });
+  if (onEnter) passive.onEnter = onEnter;
+  if (onExit) passive.onExit = onExit;
+  return passive;
+}
+
+async function submitUrl(url) {
+  addMessageToHistory("user", url);
+  isBusy = true;
+  sendBtn.disabled = true;
+  chatInput.disabled = true;
+  chatInput.value = "";
+
+  // Dave walks to the chair — use a passive variant so the regular Wikipedia
+  // loop doesn't fight the URL content for the screen.
+  if (chairDescriptor && dave && dave.currentInteraction?.label !== "chair") {
+    const chairForUrl = makePassiveSeat(chairDescriptor, {
+      onEnter(d) {
+        d.isBrowsing = true;
+      },
+      onExit(d) {
+        d.isBrowsing = false;
+        drawIdleScreen();
+      },
+    });
+    dave.startInteraction(chairForUrl, 120);
+  }
+  drawScreenText(url.slice(0, 40), [
+    "> fetching...",
+    "> this better be worth it...",
+  ]);
+
+  try {
+    const {
+      pageTitle,
+      postContent,
+      response: r,
+    } = await mindClient.browseUrl(url);
+
+    if (pageTitle) {
+      const lines = [];
+      const words = (postContent || "").split(/\s+/);
+      let line = "";
+      for (const word of words) {
+        if ((line + word).length > 48) {
+          lines.push(line.trimEnd());
+          line = "";
+        }
+        line += word + " ";
+      }
+      if (line.trim()) lines.push(line.trimEnd());
+      drawScreenText(pageTitle.slice(0, 40), lines);
+    }
+
+    if (!r?.text) return;
+    dave.expressionManager.setExpression(r.emotion);
+    if (r.speechPauseMs > 0)
+      await new Promise((res) =>
+        setTimeout(res, Math.min(r.speechPauseMs, 1500)),
+      );
+    addMessageToHistory("dave", r.text);
+    await speak(r.text, r.speechRate || 0.85);
+    dave._lockExpression(4000);
+  } catch (err) {
+    handleError("browseUrl", err);
+    drawIdleScreen();
+    addMessageToHistory("dave", "*connection lost*");
+  } finally {
+    isBusy = false;
+    sendBtn.disabled = false;
+    chatInput.disabled = false;
+    chatInput.focus();
+  }
+}
+
+async function submitMedia(file) {
+  if (isBusy) return;
+  const isVideo = file.type.startsWith("video/");
+  const isImage = file.type.startsWith("image/");
+  if (!isVideo && !isImage) return;
+
+  isBusy = true;
+  sendBtn.disabled = true;
+  attachBtn.disabled = true;
+
+  const objectUrl = URL.createObjectURL(file);
+  addMessageToHistory("user", `[${isVideo ? "video" : "image"}: ${file.name}]`);
+
+  // Apply media to TV immediately
+  tvUserMediaActive = true;
+  if (isVideo) {
+    applyVideoToTv(objectUrl);
+  } else {
+    applyImageToTv(objectUrl); // revokes objectUrl internally after load
+  }
+
+  // Send Dave to the couch using a passive variant — no auto Pexels loop;
+  // the user-uploaded media stays on the TV until Dave leaves.
+  if (couchDescriptor && dave && dave.currentInteraction?.label !== "couch") {
+    const couchForMedia = makePassiveSeat(couchDescriptor, {
+      onEnter(d) {
+        d.isWatchingTv = true;
+      },
+      onExit(d) {
+        d.isWatchingTv = false;
+        tvUserMediaActive = false;
+        clearTvVideo();
+      },
+    });
+    dave.startInteraction(couchForMedia, 120);
+  }
+
+  try {
+    const imageData = isImage
+      ? await fileToResizedBase64(file)
+      : await extractVideoFrame(objectUrl);
+
+    const { response: r } = await mindClient.analyzeMedia(
+      imageData,
+      isVideo ? "video" : "image",
+    );
+
+    if (!r?.text) return;
+    dave.expressionManager.setExpression(r.emotion);
+    if (r.speechPauseMs > 0)
+      await new Promise((res) =>
+        setTimeout(res, Math.min(r.speechPauseMs, 1500)),
+      );
+    addMessageToHistory("dave", r.text);
+    await speak(r.text, r.speechRate || 0.85);
+    dave._lockExpression(4000);
+  } catch (err) {
+    handleError("media", err);
+    addMessageToHistory("dave", "*squints at whatever you just put on his TV*");
+  } finally {
+    isBusy = false;
+    sendBtn.disabled = false;
+    attachBtn.disabled = false;
+    chatInput.focus();
+  }
+}
 
 async function sendMessage() {
   const text = chatInput.value.trim();
   if (!text || isBusy) return;
+
+  // Detect URL — send Dave to the computer to browse it
+  if (/^https?:\/\//i.test(text)) {
+    await submitUrl(text);
+    return;
+  }
 
   // Add user message to history immediately
   addMessageToHistory("user", text);
@@ -1464,13 +1974,11 @@ async function sendMessage() {
   chatInput.value = "";
 
   dave.enterTalkingState();
-  dave.lastChatTime = Date.now();
-  dave.lastAction = "talking";
   userLingerTimer = 60 + Math.random() * 30; // Reset linger after chat
 
   await new Promise((resolve) => {
     const check = setInterval(() => {
-      if (dave.state === "talking") {
+      if (dave.state === S.TALKING) {
         clearInterval(check);
         resolve();
       }
@@ -1495,7 +2003,6 @@ async function sendMessage() {
       await new Promise((resolve) => setTimeout(resolve, r.speechPauseMs));
     }
 
-    showSpeechBubble(r.text);
     addMessageToHistory("dave", r.text);
     await speak(r.text, r.speechRate || 0.85);
 
@@ -1514,7 +2021,6 @@ async function sendMessage() {
     dave.stopThinking();
     handleError("chat", err);
     const errorMsg = "*connection lost*";
-    showSpeechBubble(errorMsg);
     addMessageToHistory("dave", errorMsg);
   } finally {
     isBusy = false;
@@ -1527,6 +2033,45 @@ async function sendMessage() {
 sendBtn.addEventListener("click", sendMessage);
 chatInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") sendMessage();
+});
+
+attachBtn.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => {
+  const file = fileInput.files[0];
+  if (file) submitMedia(file);
+  fileInput.value = "";
+});
+
+// Drag and drop
+const dropOverlay = document.getElementById("dropOverlay");
+let _dragCounter = 0;
+
+document.addEventListener("dragenter", (e) => {
+  if (!e.dataTransfer.types.includes("Files")) return;
+  _dragCounter++;
+  dropOverlay.classList.add("active");
+});
+
+document.addEventListener("dragleave", () => {
+  _dragCounter = Math.max(0, _dragCounter - 1);
+  if (_dragCounter === 0) dropOverlay.classList.remove("active");
+});
+
+document.addEventListener("dragover", (e) => {
+  if (e.dataTransfer.types.includes("Files")) e.preventDefault();
+});
+
+document.addEventListener("drop", (e) => {
+  _dragCounter = 0;
+  dropOverlay.classList.remove("active");
+  e.preventDefault();
+  const file = e.dataTransfer.files[0];
+  if (
+    file &&
+    (file.type.startsWith("image/") || file.type.startsWith("video/"))
+  ) {
+    submitMedia(file);
+  }
 });
 
 // ── Mute Button ──────────────────────────────────────────────────────────
@@ -1553,7 +2098,7 @@ if ("speechSynthesis" in window) {
 
 scene.onPointerDown = (_evt, pickResult) => {
   if (!pickResult.hit || !pickResult.pickedMesh) return;
-  if (isBusy || dave.state === "talking" || dave.state === "turning-to-camera")
+  if (isBusy || dave.state === S.TALKING || dave.state === S.TURNING_TO_CAMERA)
     return;
 
   // Walk up the parent chain to find a registered interactable
@@ -1579,26 +2124,26 @@ async function handleDaveTap() {
   // Build context string based on what Dave is doing
   let contextStr = "";
 
-  if (dave.currentInteraction?.label === "computer") {
-    doBrowse();
+  // Chair is registered with label "chair" — the old "computer" check was
+  // dead code (Bug B4). Tapping Dave at the chair now triggers a fresh
+  // browse via the activity's session scheduler.
+  if (dave.currentInteraction?.label === "chair") {
+    const sched = dave._activitySession?.scheduler;
+    if (sched) doBrowse(sched);
     return;
   } else if (dave.currentInteraction?.label === "bed") {
     contextStr = "You are lying on a bed, feeling relaxed and contemplative.";
   } else if (dave.currentInteraction?.label === "couch") {
     contextStr = "You are sitting on a couch, relaxed and at ease.";
-  } else if (dave.currentInteraction?.label === "chair") {
-    contextStr = "You are sitting on a chair.";
   } else if (
     dave.currentInteraction?.label === "keg" ||
     dave.currentInteraction?.label === "kegerator"
   ) {
     contextStr = "You are standing by the kegerator, holding a beer.";
-  } else if (dave.state === "idle") {
+  } else if (dave.state === S.IDLE) {
     contextStr = "You are standing still, taking in your surroundings.";
-  } else if (dave.state === "walking") {
+  } else if (dave.state === S.WALKING) {
     contextStr = "You are walking around the space, wandering idly.";
-  } else if (dave.state === "lying") {
-    contextStr = "You are lying down, lost in thought.";
   }
 
   // Trigger musing with context
@@ -1616,11 +2161,12 @@ document.addEventListener("click", (event) => {
   // Don't trigger if clicking on UI elements
   if (
     event.target.closest("#chatBar") ||
+    event.target.closest("#attachBtn") ||
     event.target.closest("#pipBox") ||
     event.target.closest("#muteBtn") ||
     event.target.closest("#historyTab") ||
     event.target.closest("#historyPanel") ||
-    event.target.closest("#privacyNotice")
+    event.target.closest("#siteHeader")
   ) {
     return;
   }

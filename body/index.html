@@ -93,20 +93,53 @@
         pointer-events: none;
         text-shadow: 0 0 4px #000;
       }
-      #privacyNotice {
+      #siteHeader {
         position: fixed;
-        bottom: 0;
+        top: 0;
         left: 0;
         right: 0;
         text-align: center;
-        font-family: "Segoe UI", system-ui, sans-serif;
-        font-size: 10px;
-        color: #3a6b3a;
-        padding: 3px 0;
-        z-index: 8;
+        /* Left/right padding keeps the centered text clear of the PIP box
+           (top-left) and the mute button (top-right). PIP width scales with
+           viewport aspect ratio (set in JS), so clamp the padding to scale
+           sensibly from mobile portrait → desktop landscape. */
+        padding: 8px clamp(56px, 7vw, 90px) 8px clamp(100px, 24vw, 320px);
+        z-index: 10;
         pointer-events: none;
-        background: rgba(10, 26, 14, 0.55);
-        letter-spacing: 0.3px;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        line-height: 1.3;
+      }
+      #siteHeader .title {
+        display: block;
+        font-size: clamp(10px, 1.8vw, 14px);
+        color: #3a6b3a;
+        letter-spacing: 0.05em;
+        line-height: 1.2;
+      }
+      /* Long-form title for desktop / tablet; collapse to "D.A.V.E." on
+         narrow viewports so the header always fits next to the PIP. */
+      #siteHeader .title-short {
+        display: none;
+      }
+      @media (max-width: 600px) {
+        #siteHeader .title-long {
+          display: none;
+        }
+        #siteHeader .title-short {
+          display: inline;
+        }
+      }
+      #siteHeader a {
+        display: block;
+        font-size: clamp(10px, 1.8vw, 14px);
+        color: #00cc6a;
+        text-decoration: none;
+        pointer-events: auto;
+        letter-spacing: 0.05em;
+      }
+      #siteHeader a:hover {
+        color: #00ff88;
+        text-decoration: underline;
       }
       #muteBtn {
         position: fixed;
@@ -127,6 +160,34 @@
         background: rgba(10, 26, 14, 0.98);
         box-shadow: 0 0 8px rgba(0, 204, 106, 0.3);
       }
+      #attachBtn {
+        padding: 12px 14px;
+        font-size: 18px;
+        border: none;
+        border-radius: 8px;
+        background: #00cc6a;
+        color: #0a1a0e;
+        cursor: pointer;
+        flex-shrink: 0;
+      }
+      #attachBtn:hover { background: #00ff88; }
+      #attachBtn:disabled { background: #1a3a1a; cursor: not-allowed; }
+      #dropOverlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 255, 136, 0.08);
+        border: 3px dashed #00ff88;
+        z-index: 100;
+        pointer-events: none;
+        align-items: center;
+        justify-content: center;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        font-size: 24px;
+        color: #00ff88;
+        text-shadow: 0 0 20px #00ff88;
+      }
+      #dropOverlay.active { display: flex; }
       #historyContainer {
         position: fixed;
         bottom: 75px;
@@ -302,6 +363,13 @@
   </head>
   <body>
     <canvas id="renderCanvas"></canvas>
+    <div id="siteHeader">
+      <span class="title">
+        <span class="title-long">Digital Autonomous Virtual Entity (D.A.V.E)</span>
+        <span class="title-short">D.A.V.E.</span>
+      </span>
+      <a href="https://github.com/ddurks/dave" target="_blank" rel="noopener">source code</a>
+    </div>
     <div id="pipBox">
       <span id="pipLabel">Dave Gaze</span>
     </div>
@@ -313,7 +381,10 @@
       </div>
       <div id="historyPanel"></div>
     </div>
+    <div id="dropOverlay">Drop image or video on TV</div>
     <div id="chatBar">
+      <input id="fileInput" type="file" accept="image/*,video/*" style="display:none">
+      <button id="attachBtn" title="Send image or video">📎</button>
       <input
         id="chatInput"
         type="text"
@@ -323,10 +394,6 @@
       />
       <button id="sendBtn">Send</button>
     </div>
-    <div id="privacyNotice">
-      Conversations are logged for analytics — please don't share personal info.
-    </div>
-
     <!-- D.A.V.E. API Configuration -->
     <!-- 
       Set window.DAVE_API_URL before loading dave-scene.js to configure the backend URL.

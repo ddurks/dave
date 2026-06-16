@@ -25,13 +25,11 @@ Produces a static bundle in `dist/` ready to deploy (e.g. S3 static site).
 - **Tap to Interact** — Click/tap avatar to start conversation
 - **Speech** — Text-to-speech (Web Speech API)
 - **Animations** — Idle behavior, expressions, gestures
-- **Session State** — localStorage-based (stateless backend)
 
 ## Files
 
 - `index.html` — Scene setup, Babylon.js initialization
 - `dave-scene.js` — Character controller, animations, API calls
-- `memory-client.js` — Session management (localStorage)
 - `assets/` — 3D models (GLB format)
 
 ## Backend Integration

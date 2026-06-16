@@ -39,16 +39,35 @@ export class DaveMindClient {
   }
 
   /**
+   * Watch a short video on the TV
+   * Returns videoUrl (or null if Pexels isn't configured) and an optional reaction
+   */
+  async watchTv() {
+    const data = await this._post({
+      type: "watchtv",
+      sessionId: this.sessionId,
+      userId: this.userId,
+    });
+    return {
+      pageTitle: data.pageTitle || "tv",
+      videoUrl: data.videoUrl || null,
+      response: data.response || null,
+    };
+  }
+
+  /**
    * Generate a response to user input
    * @param {string} userInput - The user's message
+   * @param {Array} history - Recent turns [{role:"user"|"assistant", content:"..."}]
    * @returns {object} Response object with emotion, text, speechRate, speechPauseMs
    */
-  async respond(userInput) {
+  async respond(userInput, history = []) {
     const data = await this._post({
       type: "respond",
       sessionId: this.sessionId,
       userId: this.userId,
       userInput: userInput,
+      history,
     });
 
     return data.response || {};
@@ -89,6 +108,31 @@ export class DaveMindClient {
     });
 
     return data.directive || {};
+  }
+
+  async browseUrl(url) {
+    const data = await this._post({
+      type: "browse_url",
+      url,
+      sessionId: this.sessionId,
+      userId: this.userId,
+    });
+    return {
+      pageTitle: data.pageTitle || url,
+      postContent: data.postContent || "",
+      response: data.response || {},
+    };
+  }
+
+  async analyzeMedia(imageData, mediaType = "image") {
+    const data = await this._post({
+      type: "analyze_media",
+      imageData,
+      mediaType,
+      sessionId: this.sessionId,
+      userId: this.userId,
+    });
+    return { response: data.response || null };
   }
 
   /**

@@ -30,14 +30,14 @@ def test_parse_empty_returns_empty():
 
 
 def test_validate_standard_payload():
-    raw = '{"text": "hi", "emotion": "boredom", "subEmotion": "sub", "gesture": "shrug"}'
+    raw = '{"text": "hi", "emotion": "boredom", "gesture": "shrug"}'
     result = app.validate_response(raw)
     assert result["text"] == "hi"
     assert result["emotion"] == "boredom"
-    assert result["subEmotion"] == "sub"
     assert result["gesture"] == "shrug"
     assert result["posture"] is None
     assert result["gaze"] is None
+    assert "subEmotion" not in result
 
 
 def test_validate_missing_emotion_falls_back_to_extract():
@@ -57,5 +57,5 @@ def test_validate_broken_text_returns_fallback_dict():
     )
     assert result["emotion"] in valid_emotions
     assert result["text"] == raw[:500]
-    assert result["subEmotion"] == ""
+    assert "subEmotion" not in result
     assert result["gesture"] is None

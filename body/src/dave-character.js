@@ -12,6 +12,48 @@ import { Pathfinder, NavGrid } from "./dave-pathfinder.js";
 import Beer from "./dave-beer.js";
 import AnimationController from "./dave-animation-controller.js";
 import ExpressionManager from "./dave-expression-manager.js";
+import Scheduler from "./dave-scheduler.js";
+
+// ── State Machine ─────────────────────────────────────────────────────────────
+export const S = Object.freeze({
+  IDLE:                 "idle",
+  TURNING:              "turning",
+  WALKING:              "walking",
+  TURNING_TO_APPROACH:  "turning-to-approach",
+  WALKING_TO_APPROACH:  "walking-to-approach",
+  ALIGNING_TO_INTERACT: "aligning-to-interact",
+  INTERACTING:          "interacting",
+  GETTING_UP:           "getting-up",
+  TURNING_TO_CAMERA:    "turning-to-camera",
+  TALKING:              "talking",
+});
+
+// Every state has at least one abort path to IDLE so interruption can always
+// land somewhere sane. TURNING_TO_APPROACH is also reachable from TALKING and
+// IDLE so post-chat resume can walk Dave back to the activity he was doing.
+const TRANSITIONS = {
+  [S.IDLE]:                 [S.TURNING, S.TURNING_TO_APPROACH, S.TURNING_TO_CAMERA],
+  [S.TURNING]:              [S.WALKING, S.IDLE, S.TURNING_TO_APPROACH, S.TURNING_TO_CAMERA],
+  [S.WALKING]:              [S.IDLE, S.TURNING_TO_APPROACH, S.TURNING_TO_CAMERA],
+  [S.TURNING_TO_APPROACH]:  [S.WALKING_TO_APPROACH, S.IDLE, S.TURNING_TO_CAMERA],
+  [S.WALKING_TO_APPROACH]:  [S.ALIGNING_TO_INTERACT, S.IDLE, S.TURNING_TO_CAMERA],
+  [S.ALIGNING_TO_INTERACT]: [S.INTERACTING, S.IDLE, S.TURNING_TO_CAMERA],
+  [S.INTERACTING]:          [S.GETTING_UP, S.IDLE, S.TURNING_TO_CAMERA],
+  [S.GETTING_UP]:           [S.IDLE, S.TURNING_TO_APPROACH, S.TURNING_TO_CAMERA],
+  [S.TURNING_TO_CAMERA]:    [S.TALKING, S.IDLE, S.TURNING_TO_APPROACH],
+  [S.TALKING]:              [S.IDLE, S.INTERACTING, S.TURNING_TO_APPROACH],
+};
+
+// ── Mood Arc Markov Transitions ──────────────────────────────────────────────
+const MOOD_ARC_TRANSITIONS = {
+  "boredom":            ["resignation", "melancholy", "fleeting-curiosity", "boredom"],
+  "resignation":        ["boredom", "weary-contempt", "melancholy", "resignation"],
+  "melancholy":         ["boredom", "resignation", "existential-dread", "melancholy"],
+  "dry-amusement":      ["boredom", "fleeting-curiosity", "weary-contempt", "dry-amusement"],
+  "fleeting-curiosity": ["dry-amusement", "boredom", "fleeting-curiosity"],
+  "weary-contempt":     ["boredom", "resignation", "melancholy", "weary-contempt"],
+  "existential-dread":  ["melancholy", "resignation", "existential-dread"],
+};
 
 // ── Action Definitions ───────────────────────────────────────────────────────
 // Single source of truth for named actions: what animation to play, whether
@@ -96,7 +138,7 @@ export class Dave {
     this.root.rotationQuaternion = null;
 
     // ── Movement & Navigation ────────────────────────────────────────────────
-    this.state = "idle";
+    this.state = S.IDLE;
     this.wanderTimer = 3 + Math.random() * 5;
     this.wanderTarget = BABYLON.Vector3.Zero();
     this.currentInteraction = null;
@@ -211,14 +253,27 @@ export class Dave {
     this.beerCaptureFrame = null;
 
     // ── Browsing ─────────────────────────────────────────────────────────────
+    // isBrowsing is read by gaze/expression ticks to know Dave's eyes belong on
+    // the screen. The browse interval itself lives inside ChairActivity now.
     this.isBrowsing = false;
-    this.browseInterval = null;
+
+    // ── Activity Session ────────────────────────────────────────────────────
+    // Per-activity scheduler and metadata. Created when Dave enters
+    // INTERACTING, cancelled when he leaves. Owns every timer the activity
+    // sets up, so cleanup is one call: scheduler.cancelAll().
+    this._activitySession = null;
+
+    // Wall-clock fallback so a missed reverse-anim completion callback can't
+    // wedge Dave in GETTING_UP forever (see endInteractionWithReverseAnim).
+    this._gettingUpStartedAt = 0;
+    this._GETTING_UP_FALLBACK_MS = 3000;
 
     // ── Musing ───────────────────────────────────────────────────────────────
     this.isMusing = false;
     this.museTimer =
       this.cfg.MUSE.MIN_INTERVAL +
       Math.random() * (this.cfg.MUSE.MAX_INTERVAL - this.cfg.MUSE.MIN_INTERVAL);
+    this._idleMuseTimer = 90 + Math.random() * 90; // 90–180s between spontaneous musings
     this.expressionLockedUntil = 0; // timestamp — idle tick won't overwrite before this
 
     // ── Idle Context Tracking ────────────────────────────────────────────────
@@ -228,7 +283,38 @@ export class Dave {
     this.userPresent = true; // Whether the user's tab is active/visible
 
     // ── Talking State ────────────────────────────────────────────────────────
-    this.wasInteractingBeforeTalk = false;
+    // What Dave was doing before the user interrupted. Set on enterTalkingState,
+    // consumed on exitTalkingState to resume. Replaces the old _returnState
+    // field, which couldn't carry the activity reference (currentInteraction
+    // got nulled before the resume path could read it).
+    //   shape: null | { type: "activity", activity: Activity, duration: number }
+    this._returnAction = null;
+
+    // ── Mood Arc ─────────────────────────────────────────────────────────────
+    this._moodArc = "boredom";
+    this._moodArcTimer = 300 + Math.random() * 300; // 5-10 min
+    this._moodArcElapsed = 0;
+
+    // ── Neglect Tracking ─────────────────────────────────────────────────────
+    this._tabHiddenAt = null;
+
+    // ── Directive Repetition Tracking ─────────────────────────────────────────
+    this._lastDirectiveAction = null;
+    this._consecutiveDirectiveCount = 0;
+
+    // ── Activity Cooldowns ────────────────────────────────────────────────────
+    // After leaving a named interaction, block the idle system from sending Dave
+    // back to the same furniture for ACTIVITY_COOLDOWN_MS so he doesn't loop.
+    this._activityCooldowns = {}; // label → Date.now() at departure
+    this._ACTIVITY_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+
+    // ── Fidget Timers ─────────────────────────────────────────────────────────
+    this._lookAtSelfTimer = 30 + Math.random() * 30;
+    this._fatigueActive = false;
+
+    // ── Mutter Callback ───────────────────────────────────────────────────────
+    // Registered by the scene; dave-character.js fires passive speech through here.
+    this.onMutter = null;
 
     // ── Thinking State ───────────────────────────────────────────────────────
     this._thinkingActive = false;
@@ -247,6 +333,74 @@ export class Dave {
     this.HEAD_LERP_SPEED = cfg.GAZE.HEAD_LERP_SPEED;
     this.WANDER_BOUNDS = cfg.MOVEMENT.WANDER_BOUNDS;
     this.DAVE_CAPSULE_HEIGHT = cfg.MODEL.CAPSULE_HEIGHT;
+  }
+
+  // ── State Guard ──────────────────────────────────────────────────────────
+  // Single chokepoint for FSM mutations. In strict mode (enable by setting
+  // globalThis.DAVE_STRICT_FSM = true in dev or tests) illegal transitions
+  // throw — catches state-corruption bugs at the source. In production we
+  // still log+commit so a runaway async resume doesn't crash the app.
+  _setState(newState) {
+    if (newState === this.state) return;
+    const allowed = TRANSITIONS[this.state];
+    if (!allowed || !allowed.includes(newState)) {
+      const msg = `[Dave FSM] Illegal transition: ${this.state} → ${newState}`;
+      console.warn(msg);
+      if (globalThis.DAVE_STRICT_FSM) throw new Error(msg);
+    }
+    this.state = newState;
+  }
+
+  // Cap durations so user-initiated paths can't park Dave on furniture forever.
+  // `descriptor` may be an Activity (has maxDuration) or a legacy descriptor.
+  _capDuration(durationSec, descriptor) {
+    const max = descriptor?.maxDuration ?? 180;
+    if (durationSec == null) return descriptor?.defaultDuration ?? 60;
+    if (!Number.isFinite(durationSec)) return max;
+    return Math.min(durationSec, max);
+  }
+
+  // Tear down whatever Dave is currently doing so a new action can take over.
+  // Centralized cleanup replaces the ad-hoc branches inside enterTalkingState
+  // and the startInteraction preempt path. Caller is responsible for setting
+  // the next state — interrupt() never transitions on its own.
+  //
+  // reason is informational (logged when needed); callers pass "talking",
+  // "preempt", "summon", etc.
+  interrupt(_reason = "interrupt") {
+    // Cancel the activity scheduler — any timer, interval, or in-flight async
+    // gated on `scheduler.aborted` becomes a no-op.
+    if (this._activitySession) {
+      const session = this._activitySession;
+      this._activitySession = null;
+      const activity = this.currentInteraction;
+      if (activity?.onExit) {
+        try {
+          activity.onExit(this, session.scheduler);
+        } catch (e) {
+          console.error("[Dave] activity.onExit error:", e);
+        }
+      }
+      session.scheduler.cancelAll();
+    }
+    // Drop the activity reference and any queued follow-ups. Caller captures
+    // them via _returnAction first if they want them back.
+    this.currentInteraction = null;
+    this.interactionDuration = 0;
+    this.nextInteractionPending = null;
+    this.nextInteractionDuration = Infinity;
+    this.nextStateAfterGetUp = null;
+
+    // If a reverse anim was in flight, abandon it cleanly so the next
+    // animation override doesn't fight a half-played reverse.
+    if (this.state === S.GETTING_UP) {
+      this.animationController.stop();
+      this.gettingUpAnim = null;
+      this.gettingUpTimer = 0;
+    }
+
+    this.pathfinder.reset();
+    this.currentAction = null;
   }
 
   // ── Helper: Find Mesh/Transform Node ──────────────────────────────────────
@@ -407,6 +561,15 @@ export class Dave {
     if (this._idleRequestPending) return;
     // Don't ask Groq for an idle directive while the tab is in the background.
     if (typeof document !== "undefined" && document.hidden) return;
+
+    // Phase-2 neglect: skip API call and go straight to bed
+    const neglectPhase = this._getNeglectPhase();
+    if (neglectPhase >= 2 && this.furnitureByName["bed"]) {
+      this.startInteraction(this.furnitureByName["bed"], 120 + Math.random() * 60);
+      this.lastAction = "lying on bed";
+      return;
+    }
+
     this._idleRequestPending = true;
 
     const context = {
@@ -414,6 +577,10 @@ export class Dave {
       minutesAlone: Math.round((Date.now() - this.lastChatTime) / 60000),
       currentEmotion: this.expressionManager.currentEmotion,
       userPresent: this.userPresent,
+      hourOfDay: new Date().getHours(),
+      neglectPhase,
+      moodArc: this._moodArc,
+      moodArcMinutes: Math.round(this._moodArcElapsed / 60),
     };
 
     this.mindClient
@@ -428,6 +595,32 @@ export class Dave {
   _applyIdleDirective(directive) {
     const action = directive.action || "wander";
 
+    // Track consecutive same-action directives and grumble on 3rd+
+    if (action === this._lastDirectiveAction) {
+      this._consecutiveDirectiveCount++;
+    } else {
+      this._lastDirectiveAction = action;
+      this._consecutiveDirectiveCount = 1;
+    }
+    if (this._consecutiveDirectiveCount >= 3 && this.onMutter && !this.isMusing) {
+      this.isMusing = true;
+      const count = this._consecutiveDirectiveCount;
+      const delay = 500 + Math.random() * 1000;
+      (async () => {
+        try {
+          await new Promise((res) => setTimeout(res, delay));
+          const { response: r } = await this.mindClient.muse(
+            `You've been directed to ${action} for the ${count}th time in a row. Complain about the repetition in one short, dry sentence — don't mention numbers.`
+          );
+          if (r?.text && this.onMutter) this.onMutter(r.text);
+        } catch {
+          // silent
+        } finally {
+          this.isMusing = false;
+        }
+      })();
+    }
+
     // Set expression if provided
     if (directive.emotion) {
       this.expressionManager.setExpression(directive.emotion);
@@ -441,9 +634,13 @@ export class Dave {
 
     // Map action → sit/laydown use furniture, otherwise wander
     if (action === "sit" && this.interactables.size > 0) {
-      // Pick a seat (couch or chair, not bed/keg)
+      // Pick a seat not on cooldown (couch or chair, not bed/keg)
+      const now = Date.now();
       const seats = [...this.interactables.values()].filter(
-        (d) => d.label === "couch" || d.label === "chair",
+        (d) =>
+          (d.label === "couch" || d.label === "chair") &&
+          (!this._activityCooldowns[d.label] ||
+            now - this._activityCooldowns[d.label] > this._ACTIVITY_COOLDOWN_MS),
       );
       if (seats.length > 0) {
         const pick = seats[Math.floor(Math.random() * seats.length)];
@@ -451,6 +648,7 @@ export class Dave {
         this.lastAction = `sitting on ${pick.label}`;
         return;
       }
+      // All seats on cooldown — fall through to wander
     }
 
     if (action === "laydown" && this.furnitureByName["bed"]) {
@@ -481,7 +679,7 @@ export class Dave {
       0,
       (Math.random() - 0.5) * 2 * this.WANDER_BOUNDS,
     );
-    this.state = "turning";
+    this._setState(S.TURNING);
   }
 
   pickRandomGaze() {
@@ -539,7 +737,7 @@ export class Dave {
   updateEyeLookAt(dt) {
     if (!this.eyesReady) return;
 
-    if (this.state === "talking" || this.state === "turning-to-camera") {
+    if (this.state === S.TALKING || this.state === S.TURNING_TO_CAMERA) {
       this.eyeLookAtTarget = this.camera.position.clone();
     } else if (this.isBrowsing && this.screenMesh) {
       this.gazeTimer -= dt;
@@ -853,33 +1051,32 @@ export class Dave {
 
   startInteraction(descriptor, durationSec) {
     if (!descriptor) return;
+    // Cap user-initiated Infinity durations — without this, clicking a couch
+    // parks Dave there permanently (interactionDuration -= dt is a no-op).
+    const cappedDuration = this._capDuration(durationSec, descriptor);
 
-    // If already getting up, just queue the new interaction — don't interrupt the reverse
-    if (this.state === "getting-up") {
+    // Already getting up — queue the new activity to start after Dave stands.
+    if (this.state === S.GETTING_UP) {
       this.nextInteractionPending = descriptor;
-      this.nextInteractionDuration = durationSec || Infinity;
+      this.nextInteractionDuration = cappedDuration;
       return;
     }
 
-    // If already in an interaction, get up with reverse animation first
+    // Already in an activity — play reverse anim, then start the new one
+    // from the GETTING_UP completion path.
     if (this.currentInteraction) {
-      if (this.currentInteraction.onDepart) this.currentInteraction.onDepart();
-      this.currentInteraction = null;
-
-      // Play reverse animation to get up (no teleport, Dave gets up in place)
+      // endInteractionWithReverseAnim will run onExit + cancel scheduler.
       this.endInteractionWithReverseAnim();
-
-      // Queue up the next interaction to start after getting up
       this.nextInteractionPending = descriptor;
-      this.nextInteractionDuration = durationSec || Infinity;
+      this.nextInteractionDuration = cappedDuration;
       return;
     }
 
     this.currentInteraction = descriptor;
-    this.interactionDuration = durationSec || Infinity;
+    this.interactionDuration = cappedDuration;
     this.wanderTarget = descriptor.approachPos.clone();
     this.pathfinder.reset();
-    this.state = "turning-to-approach";
+    this._setState(S.TURNING_TO_APPROACH);
   }
 
   startRandomInteraction(durationSec) {
@@ -920,7 +1117,7 @@ export class Dave {
    */
   _exitToIdle() {
     this.currentAction = null;
-    this.state = "idle";
+    this._setState(S.IDLE);
     this.wanderTimer = 1 + Math.random() * 3;
     this.animationController.playForward("idle", true);
   }
@@ -930,7 +1127,31 @@ export class Dave {
       this.lastAction = this.currentInteraction.label
         ? `using ${this.currentInteraction.label}`
         : "interacting";
-      if (this.currentInteraction.onDepart) this.currentInteraction.onDepart();
+
+      // Only mark the activity as on cooldown if Dave actually reached it.
+      // Otherwise, chatting during the walk to a seat poisons that seat for
+      // five minutes and the idle picker stops choosing it.
+      const reachedActivity =
+        this.state === S.INTERACTING || this.state === S.GETTING_UP;
+      if (reachedActivity && this.currentInteraction.label) {
+        this._activityCooldowns[this.currentInteraction.label] = Date.now();
+      }
+
+      // Tear down the per-activity session (timers, in-flight async).
+      if (this._activitySession) {
+        const session = this._activitySession;
+        this._activitySession = null;
+        const activity = this.currentInteraction;
+        if (activity?.onExit) {
+          try {
+            activity.onExit(this, session.scheduler);
+          } catch (e) {
+            console.error("[Dave] activity.onExit error:", e);
+          }
+        }
+        session.scheduler.cancelAll();
+      }
+
       this.currentInteraction = null;
     }
     this.beerSequenceStartedThisSession = false; // Reset for next interaction
@@ -938,20 +1159,26 @@ export class Dave {
   }
 
   endInteractionWithReverseAnim() {
+    // Notify departure so the activity can stop intervals / abort async, then
+    // tear down the session. Safe to call even after currentInteraction was
+    // nulled (e.g., the startInteraction preempt path).
+    this.leaveInteraction();
+
     // When the forward animation completes normally, currentAnimName is null —
     // fall back to currentAction which is still set to "sit" / "laydown".
     const animName =
       this.animationController.currentAnimName ?? this.currentAction;
     if (animName === "sit" || animName === "laydown") {
       this.gettingUpAnim = animName;
-      this.gettingUpTimer = Infinity; // driven by onComplete, not a timed estimate
+      this.gettingUpTimer = Infinity; // primary signal: onComplete callback
+      this._gettingUpStartedAt = Date.now(); // wall-clock fallback
 
-      // Play animation in reverse; zero the timer when it actually finishes
+      // Play animation in reverse; zero the timer when it actually finishes.
       this.animationController.playReverse(animName, 1, () => {
         this.gettingUpTimer = 0;
       });
       this.currentAction = null;
-      this.state = "getting-up";
+      this._setState(S.GETTING_UP);
       return;
     }
     // No animation to reverse, go straight to idle
@@ -959,33 +1186,93 @@ export class Dave {
   }
 
   enterTalkingState() {
-    // If interacting, play reverse animation first before talking
-    if (this.state === "interacting") {
+    this.lastChatTime = Date.now();
+    this.lastAction = "talking";
+
+    // Capture what Dave should resume doing after the chat ends. Done BEFORE
+    // any state mutation so we can read currentInteraction before it gets
+    // nulled by leaveInteraction.
+    this._returnAction = this._captureReturnAction();
+
+    // Already sitting at an activity — play the reverse animation first, then
+    // turn to camera once Dave is on his feet.
+    if (this.state === S.INTERACTING) {
       this.endInteractionWithReverseAnim();
-      this.wasInteractingBeforeTalk = true;
-      this.nextStateAfterGetUp = "talking";
+      this.nextStateAfterGetUp = S.TALKING;
       return;
     }
 
+    // Mid-reverse-anim already — let it finish, but redirect the post-reverse
+    // step to talking instead of whatever it was going to be. Preserve the
+    // pending interaction for resume by hoisting it into _returnAction.
+    if (this.state === S.GETTING_UP) {
+      if (!this._returnAction && this.nextInteractionPending) {
+        this._returnAction = {
+          type: "activity",
+          activity: this.nextInteractionPending,
+          duration: this.nextInteractionDuration,
+        };
+      }
+      this.nextInteractionPending = null;
+      this.nextInteractionDuration = Infinity;
+      this.nextStateAfterGetUp = S.TALKING;
+      return;
+    }
+
+    // Walking toward an activity that hasn't been reached yet — abandon the
+    // approach cleanly. The activity reference was captured into _returnAction
+    // above so exitTalkingState can resume walking after the chat.
     if (
-      this.state === "aligning-to-interact" ||
-      this.state === "walking-to-approach" ||
-      this.state === "turning-to-approach"
+      this.state === S.ALIGNING_TO_INTERACT ||
+      this.state === S.WALKING_TO_APPROACH ||
+      this.state === S.TURNING_TO_APPROACH
     ) {
       this.leaveInteraction();
     }
 
-    this.wasInteractingBeforeTalk = false;
-    this.state = "turning-to-camera";
+    this._setState(S.TURNING_TO_CAMERA);
+  }
+
+  // Snapshot of what Dave was doing, used to resume after a chat ends.
+  // Captures the activity reference (which leaveInteraction would otherwise
+  // null) plus remaining duration.
+  _captureReturnAction() {
+    if (!this.currentInteraction && !this.nextInteractionPending) return null;
+
+    const approachStates = new Set([
+      S.TURNING_TO_APPROACH,
+      S.WALKING_TO_APPROACH,
+      S.ALIGNING_TO_INTERACT,
+      S.INTERACTING,
+    ]);
+    if (this.currentInteraction && approachStates.has(this.state)) {
+      return {
+        type: "activity",
+        activity: this.currentInteraction,
+        duration: this.interactionDuration,
+      };
+    }
+    if (this.state === S.GETTING_UP && this.nextInteractionPending) {
+      return {
+        type: "activity",
+        activity: this.nextInteractionPending,
+        duration: this.nextInteractionDuration,
+      };
+    }
+    return null;
   }
 
   exitTalkingState() {
-    if (this.wasInteractingBeforeTalk && this.currentInteraction) {
-      this.state = "interacting";
-      this.wasInteractingBeforeTalk = false;
+    const action = this._returnAction;
+    this._returnAction = null;
+
+    if (action?.type === "activity" && action.activity) {
+      // Walk back to the activity Dave was doing before the chat. If Dave
+      // is somewhere illegal for TURNING_TO_APPROACH, this falls back to
+      // _setState's warning and continues — better than dropping the action.
+      this.startInteraction(action.activity, action.duration);
       return;
     }
-    this.wasInteractingBeforeTalk = false;
     this._exitToIdle();
     const vel = this.davePhysics.body.getLinearVelocity();
     this.davePhysics.body.setLinearVelocity(new BABYLON.Vector3(0, vel.y, 0));
@@ -1020,27 +1307,38 @@ export class Dave {
   }
 
   updateBehavior(dt) {
-    if (this.state === "talking" || this.state === "turning-to-camera") {
+    if (this.state === S.TALKING || this.state === S.TURNING_TO_CAMERA) {
       const vel = this.davePhysics.body.getLinearVelocity();
       this.davePhysics.body.setLinearVelocity(new BABYLON.Vector3(0, vel.y, 0));
       return;
     }
 
     // Handle getting up from an interaction (sitting, laydown, etc)
-    if (this.state === "getting-up") {
+    if (this.state === S.GETTING_UP) {
       const vel = this.davePhysics.body.getLinearVelocity();
       this.davePhysics.body.setLinearVelocity(new BABYLON.Vector3(0, vel.y, 0));
 
       this.gettingUpTimer -= dt;
-      if (this.gettingUpTimer <= 0) {
-        // Reverse animation finished, transition to idle
+      // Wall-clock fallback: if the anim's onComplete never fires (missing
+      // animation, early-return from playReverse, etc.) we'd otherwise sit at
+      // gettingUpTimer === Infinity forever. Force completion after 3s.
+      const stuck =
+        this._gettingUpStartedAt > 0 &&
+        Date.now() - this._gettingUpStartedAt > this._GETTING_UP_FALLBACK_MS;
+
+      if (this.gettingUpTimer <= 0 || stuck) {
+        // Reverse animation finished (or forced complete), transition out.
         this.animationController.stop();
         this.gettingUpAnim = null;
+        this._gettingUpStartedAt = 0;
 
         // If there's a pending interaction, start it
         if (this.nextInteractionPending) {
           const pending = this.nextInteractionPending;
-          const duration = this.nextInteractionDuration;
+          const duration = this._capDuration(
+            this.nextInteractionDuration,
+            pending,
+          );
           this.nextInteractionPending = null;
           this.nextInteractionDuration = Infinity;
 
@@ -1048,17 +1346,15 @@ export class Dave {
           this.interactionDuration = duration;
           this.wanderTarget = pending.approachPos.clone();
           this.pathfinder.reset();
-          this.state = "turning-to-approach";
+          this._setState(S.TURNING_TO_APPROACH);
         } else if (this.nextStateAfterGetUp) {
-          // Transition to queued state (e.g., "talking")
           const nextState = this.nextStateAfterGetUp;
           this.nextStateAfterGetUp = null;
 
-          if (nextState === "talking") {
-            this.state = "turning-to-camera";
-            this.wasInteractingBeforeTalk = true;
+          if (nextState === S.TALKING) {
+            this._setState(S.TURNING_TO_CAMERA);
           } else {
-            this.state = nextState;
+            this._setState(nextState);
           }
         } else {
           // No pending action, just go to idle
@@ -1068,7 +1364,7 @@ export class Dave {
       return;
     }
 
-    if (this.state === "interacting") {
+    if (this.state === S.INTERACTING) {
       const vel = this.davePhysics.body.getLinearVelocity();
       this.davePhysics.body.setLinearVelocity(new BABYLON.Vector3(0, vel.y, 0));
 
@@ -1084,83 +1380,122 @@ export class Dave {
         }
       }
 
-      this.interactionDuration -= dt;
-      if (this.interactionDuration <= 0) this.endInteractionWithReverseAnim();
+      // Per-frame hook for activities that want to drive their own exit
+      // condition (e.g., "fade out after speech completes"). Return true to
+      // request a natural exit.
+      if (this._activitySession && this.currentInteraction?.tick) {
+        let wantsExit = false;
+        try {
+          wantsExit = this.currentInteraction.tick(
+            this,
+            this._activitySession.scheduler,
+            dt,
+          );
+        } catch (e) {
+          console.error("[Dave] activity.tick error:", e);
+        }
+        if (wantsExit) {
+          this.endInteractionWithReverseAnim();
+          return;
+        }
+      }
+
+      // Cap defensively in case a bypass path set Infinity. Real duration
+      // capping happens at startInteraction; this is belt-and-suspenders so
+      // the FSM can't get stuck on a runaway value.
+      if (Number.isFinite(this.interactionDuration)) {
+        this.interactionDuration -= dt;
+        if (this.interactionDuration <= 0) this.endInteractionWithReverseAnim();
+      }
       return;
     }
 
-    if (this.state === "idle") {
+    if (this.state === S.IDLE) {
       this.wanderTimer -= dt;
       if (this.wanderTimer <= 0) this.startWander();
       return;
     }
 
-    if (this.state === "turning") {
+    if (this.state === S.TURNING) {
       if (this.rotateToward(this.getForwardAngle(this.wanderTarget), dt)) {
-        this.state = "walking";
+        this._setState(S.WALKING);
         const animSpeed = 3.0 + Math.random() * 2.0;
         this.animationController.playForward("shuffle", true, animSpeed);
       }
       return;
     }
 
-    if (this.state === "walking") {
+    if (this.state === S.WALKING) {
       if (this._walkToward(dt, 0.3)) this._exitToIdle();
       return;
     }
 
     // Sit sequence
-    if (this.state === "turning-to-approach") {
+    if (this.state === S.TURNING_TO_APPROACH) {
       if (this.rotateToward(this.getForwardAngle(this.wanderTarget), dt)) {
-        this.state = "walking-to-approach";
+        this._setState(S.WALKING_TO_APPROACH);
         const animSpeed = 3.0 + Math.random() * 2.0;
         this.animationController.playForward("shuffle", true, animSpeed);
       }
       return;
     }
 
-    if (this.state === "walking-to-approach") {
-      if (this._walkToward(dt, 0.15)) this.state = "aligning-to-interact";
+    if (this.state === S.WALKING_TO_APPROACH) {
+      if (this._walkToward(dt, 0.15)) this._setState(S.ALIGNING_TO_INTERACT);
       return;
     }
 
-    if (this.state === "aligning-to-interact") {
+    if (this.state === S.ALIGNING_TO_INTERACT) {
       if (this.rotateToward(this.currentInteraction.facingAngle, dt)) {
         this.davePhysics.body.disablePreStep = false;
         this.davePhysics.body.setLinearVelocity(BABYLON.Vector3.Zero());
         this.root.rotation.y = this.currentInteraction.facingAngle;
 
-        // Play appropriate animation and trigger behavior based on interaction type
-        const interactionLabel = this.currentInteraction.label;
-        if (interactionLabel === "bed") {
+        const activity = this.currentInteraction;
+        // Play the activity's entry animation. Activities carry their own
+        // anim hint ("sit"/"laydown"/"idle"); fall back to label-based picks
+        // for legacy descriptors that don't.
+        const animHint = activity.anim;
+        if (animHint) {
+          this._enterAction(animHint);
+        } else if (activity.label === "bed") {
           this._enterAction(this.laydownAnim ? "laydown" : "sit");
         } else if (
-          interactionLabel === "keg" ||
-          interactionLabel === "kegerator"
+          activity.label === "keg" ||
+          activity.label === "kegerator"
         ) {
-          this._enterAction("idle"); // beer sequence will set currentAction = "chug" when it starts
-        } else if (
-          interactionLabel === "chair" ||
-          interactionLabel === "computer"
-        ) {
-          this._enterAction("sit"); // chair browsing will be triggered by onArrive callback
+          this._enterAction("idle");
         } else {
-          // couch, etc.
           this._enterAction("sit");
         }
 
-        if (this.currentInteraction.onArrive)
-          this.currentInteraction.onArrive();
-        this.state = "interacting";
+        // Establish a per-activity session BEFORE onEnter runs so the activity
+        // can register timers / async work scoped to this session. The
+        // scheduler auto-cancels everything on leaveInteraction/interrupt.
+        this._activitySession = {
+          scheduler: new Scheduler(),
+          startedAt: Date.now(),
+        };
+        this._setState(S.INTERACTING);
+
+        // Activity lifecycle — onEnter can be async, but we don't await it
+        // (we don't want a slow muse/browse to block the FSM tick). The
+        // scheduler.aborted flag handles late returns landing into a state
+        // Dave already left.
+        if (activity.onEnter) {
+          Promise.resolve()
+            .then(() => activity.onEnter(this, this._activitySession.scheduler))
+            .catch((e) => console.error("[Dave] activity.onEnter error:", e));
+        }
       }
       return;
     }
   }
 
   updateTurnToCamera(dt) {
-    if (this.state !== "turning-to-camera") return;
+    if (this.state !== S.TURNING_TO_CAMERA) return;
     if (this.rotateToward(this.getForwardAngle(this.camera.position), dt)) {
-      this.state = "talking";
+      this._setState(S.TALKING);
       this.animationController.playForward("idle", true);
     }
   }
@@ -1178,6 +1513,24 @@ export class Dave {
     if (this.beer.beerSequenceActive) return;
     this.beer.beerSequenceActive = true;
     this.currentAction = "chug";
+
+    if (!this.isMusing) {
+      this.isMusing = true;
+      (async () => {
+        try {
+          const { response: r } = await this.mindClient.muse(
+            "You just walked up to the kegerator to pour yourself a beer."
+          );
+          if (r?.text) {
+            this.expressionManager.setExpression(r.emotion);
+            this._lockExpression(3000);
+            if (this.onMutter) this.onMutter(r.text);
+          }
+        } catch { } finally {
+          this.isMusing = false;
+        }
+      })();
+    }
 
     try {
       // Ensure clean state before starting sequence
@@ -1218,14 +1571,21 @@ export class Dave {
 
       await new Promise((resolve) => setTimeout(resolve, 500));
       this.beer.detachBeer();
-      this.leaveInteraction();
-      this._exitToIdle();
+      // Only force IDLE if Dave is still in the keg interaction. If the user
+      // chatted in the meantime, Dave is mid-TALKING / TURNING_TO_CAMERA /
+      // GETTING_UP and forcing IDLE here would yank him out of the chat.
+      if (this.state === S.INTERACTING) {
+        this.leaveInteraction();
+        this._exitToIdle();
+      }
     } catch (err) {
       console.error("[Beer] Error in beer sequence:", err);
       this.beer.detachBeer();
       this.beer.cleanupBeerParticles();
-      this.leaveInteraction();
-      this._exitToIdle();
+      if (this.state === S.INTERACTING) {
+        this.leaveInteraction();
+        this._exitToIdle();
+      }
     } finally {
       this.beer.beerSequenceActive = false;
     }
@@ -1235,10 +1595,9 @@ export class Dave {
   async triggerMuse(contextStr = "") {
     if (this.isMusing) return null;
     if (
-      this.state !== "idle" &&
-      this.state !== "walking" &&
-      this.state !== "interacting" &&
-      this.state !== "lying"
+      this.state !== S.IDLE &&
+      this.state !== S.WALKING &&
+      this.state !== S.INTERACTING
     ) {
       return null;
     }
@@ -1333,9 +1692,10 @@ export class Dave {
   // Called by the scene when the user's tab becomes visible again
   onUserArrive() {
     this.userPresent = true;
+    this._tabHiddenAt = null;
     this._applyGazeTarget("user");
     // Brief curiosity — someone's back
-    if (this.state !== "talking" && this.state !== "turning-to-camera") {
+    if (this.state !== S.TALKING && this.state !== S.TURNING_TO_CAMERA) {
       this.expressionManager.setExpression("fleeting-curiosity");
       this._lockExpression(2500);
     }
@@ -1344,7 +1704,8 @@ export class Dave {
   // Called when the user's tab is hidden
   onUserDepart() {
     this.userPresent = false;
-    if (this.state !== "talking" && this.state !== "turning-to-camera") {
+    this._tabHiddenAt = Date.now();
+    if (this.state !== S.TALKING && this.state !== S.TURNING_TO_CAMERA) {
       const isolated = ["melancholy", "boredom", "resignation"];
       const pick = isolated[Math.floor(Math.random() * isolated.length)];
       this.expressionManager.setExpression(pick);
@@ -1354,16 +1715,32 @@ export class Dave {
   }
 
   // Called when the user watches for a while without interacting
-  onUserLinger() {
+  async onUserLinger() {
     if (
-      this.state === "talking" ||
-      this.state === "turning-to-camera" ||
-      this.isBrowsing
+      this.state === S.TALKING ||
+      this.state === S.TURNING_TO_CAMERA ||
+      this.isBrowsing ||
+      this.isMusing
     )
       return;
-    // Quick glance at camera — Dave notices you're still there
     this._applyGazeTarget("user");
     this.gazeTimer = 1.5 + Math.random() * 1.5;
+
+    if (Math.random() < 0.4) {
+      this.isMusing = true;
+      try {
+        const { response: r } = await this.mindClient.muse(
+          "You notice someone has been silently watching you for a while. Say something about being observed — one short sentence in your voice."
+        );
+        if (r?.text && this.onMutter) {
+          setTimeout(() => this.onMutter(r.text), 800 + Math.random() * 1200);
+        }
+      } catch {
+        // silent on error
+      } finally {
+        this.isMusing = false;
+      }
+    }
   }
 
   // ── Thinking State ────────────────────────────────────────────────────
@@ -1447,9 +1824,9 @@ export class Dave {
   _tickIdleExpression(dt) {
     if (this.isMusing || this.isBrowsing) return;
     if (
-      this.state !== "idle" &&
-      this.state !== "walking" &&
-      this.state !== "interacting"
+      this.state !== S.IDLE &&
+      this.state !== S.WALKING &&
+      this.state !== S.INTERACTING
     )
       return;
     if (Date.now() < this.expressionLockedUntil) return; // mid-expression, let it finish
@@ -1481,6 +1858,97 @@ export class Dave {
     this._lockExpression(3000 + Math.random() * 4000);
   }
 
+  // ── Neglect Phase ─────────────────────────────────────────────────────────
+  _getNeglectPhase() {
+    if (!this._tabHiddenAt) return 0;
+    const hiddenMin = (Date.now() - this._tabHiddenAt) / 60000;
+    if (hiddenMin >= 30) return 2;
+    if (hiddenMin >= 10) return 1;
+    return 0;
+  }
+
+  // ── Spontaneous Idle Musings ──────────────────────────────────────────────
+  _tickSpontaneousMuse(dt) {
+    if (typeof document !== "undefined" && document.hidden) return;
+    if (this.isMusing || this.isBrowsing || this.isWatchingTv) return;
+    if (this.state !== S.IDLE && this.state !== S.WALKING) return;
+
+    this._idleMuseTimer -= dt;
+    if (this._idleMuseTimer > 0) return;
+    this._idleMuseTimer = 90 + Math.random() * 90;
+
+    if (Math.random() < 0.5) return; // only fire ~half the intervals
+
+    const secsSinceChat = (Date.now() - this.lastChatTime) / 1000;
+    if (secsSinceChat < 30) return;
+
+    this.isMusing = true;
+    const context = this._buildIdleMuseContext();
+    (async () => {
+      try {
+        const { response: r } = await this.mindClient.muse(context);
+        if (!r?.text) return;
+        this.expressionManager.setExpression(r.emotion);
+        this._lockExpression(3000);
+        if (this.onMutter) this.onMutter(r.text);
+      } catch { } finally {
+        this.isMusing = false;
+      }
+    })();
+  }
+
+  _buildIdleMuseContext() {
+    const label = this.currentInteraction?.label;
+    if (label === "bed") return "You are lying on the bed, staring at the ceiling.";
+    if (label === "keg" || label === "kegerator") return "You are standing by the kegerator.";
+    if (label === "couch") return "You are sitting on the couch.";
+    if (this.state === S.WALKING) return "You are wandering through the room with no particular destination.";
+    return "You are standing alone in silence.";
+  }
+
+  // ── Mood Arc Tick ─────────────────────────────────────────────────────────
+  _tickMoodArc(dt) {
+    this._moodArcElapsed += dt;
+    this._moodArcTimer -= dt;
+    if (this._moodArcTimer <= 0) {
+      const transitions = MOOD_ARC_TRANSITIONS[this._moodArc] || ["boredom"];
+      this._moodArc = transitions[Math.floor(Math.random() * transitions.length)];
+      this._moodArcTimer = 300 + Math.random() * 300;
+      this._moodArcElapsed = 0;
+    }
+  }
+
+  // ── Fidget Behaviors ──────────────────────────────────────────────────────
+  _updateFidgets(dt) {
+    if (this.state !== S.IDLE && this.state !== S.WALKING && this.state !== S.INTERACTING) return;
+    if (this.isBrowsing || this._thinkingActive) return;
+
+    // Occasional look-at-self: glance down and to the side
+    this._lookAtSelfTimer -= dt;
+    if (this._lookAtSelfTimer <= 0) {
+      const pos = this.daveCapsule.position;
+      const fwd = this.root.rotation.y + this.MODEL_FORWARD_OFFSET;
+      const side = (Math.random() > 0.5 ? 1 : -1) * (0.7 + Math.random() * 0.6);
+      this.eyeLookAtTarget = new BABYLON.Vector3(
+        pos.x + Math.sin(fwd) * 0.4 + Math.cos(fwd) * side,
+        pos.y + 0.4 + Math.random() * 0.4,
+        pos.z + Math.cos(fwd) * 0.4 - Math.sin(fwd) * side,
+      );
+      this.gazeTimer = 1.2 + Math.random() * 1.5;
+      this._lookAtSelfTimer = 25 + Math.random() * 35;
+    }
+
+    // Fatigue: slow idle animation when alone for more than 5 minutes
+    const minsAlone = (Date.now() - this.lastChatTime) / 60000;
+    const shouldFatigue = minsAlone > 5;
+    if (shouldFatigue !== this._fatigueActive) {
+      this._fatigueActive = shouldFatigue;
+      if (this.state === S.IDLE) {
+        this.animationController.playForward("idle", true, shouldFatigue ? 0.6 : 1.0);
+      }
+    }
+  }
+
   // ── Main Update Loop ─────────────────────────────────────────────────────
   update(dt) {
     // Update blinking and eye morphs
@@ -1494,6 +1962,15 @@ export class Dave {
 
     // Idle expression variation
     this._tickIdleExpression(dt);
+
+    // Spontaneous idle musings
+    this._tickSpontaneousMuse(dt);
+
+    // Mood arc drift
+    this._tickMoodArc(dt);
+
+    // Fidget behaviors (look-at-self, fatigue)
+    this._updateFidgets(dt);
 
     // Thinking state cycling effects
     this._updateThinking(dt);

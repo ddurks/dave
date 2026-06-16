@@ -6,9 +6,8 @@ A 3D AI character you can talk to. Dave wanders his enclosure, sits on the couch
 
 ## How it works
 
-- **mind/** — Python Flask backend wrapping a [Groq](https://groq.com) LLM (Llama 3.1 8B). Four request types: `respond` (user chat), `idle` (autonomous next-action directive), `browse` (read a random Wikipedia article and react), `muse` (internal monologue). The same code runs locally under Flask and in production as an AWS Lambda via the Serverless Framework.
+- **mind/** — Python Flask backend wrapping a [Groq](https://groq.com) LLM (Llama 3.1 8B). Four request types: `respond` (user chat), `idle` (autonomous next-action directive), `browse` (read a random Wikipedia article and react), `muse` (internal monologue). The same code runs locally under Flask and in production as an AWS Lambda via the Serverless Framework. The backend is stateless — the client sends recent conversation turns with each `respond` request.
 - **body/** — Babylon.js scene with Havok physics. Renders Dave, his apartment, the camera-character that watches him, speech bubbles, and the picture-in-picture eye view. Vite for dev/build.
-- **State** — Conversation history persists per-session on S3 in production (1-day TTL), in-memory locally. Every interaction is logged to a separate S3 bucket for audit.
 
 ## Quick start
 
@@ -31,9 +30,7 @@ PORT=3000
 | Path | What |
 | --- | --- |
 | `mind/app.py` | Flask + Lambda handler, request dispatcher |
-| `mind/sessions.py` | Conversation storage (in-memory / S3) |
 | `mind/tools.py` | Groq tool-use schemas + failed-generation salvage |
-| `mind/turnlog.py` | Per-turn S3 audit log |
 | `mind/data/*.json` | The personality — system prompt, muse prompts, idle directives |
 | `mind/tests/` | pytest suite |
 | `body/dave-scene.js` | Scene entry — engine, lights, physics, UI wiring |

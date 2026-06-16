@@ -4,6 +4,19 @@
  * Supports smooth transitions between emotional states
  */
 
+// Morph targets that are exclusively owned by a different system. The
+// expression manager must NOT iterate over these in _updateMorphs — that
+// would clobber the owning system's per-frame writes:
+//   - "Close" on the eyelid is owned by updateBlink (Dave class)
+//   - "Open"  on the body   is owned by _updateLipSync below
+// (CamCharacter's updateExpression has the same Close carve-out — Dave's
+// was missing, which is why the blink appeared to "get cut off".)
+const CONTROL_MORPHS = {
+  eyelid: new Set(["Close"]),
+  body: new Set(["Open"]),
+  eyebrow: new Set(),
+};
+
 export class ExpressionManager {
   /**
    * Constructor
@@ -112,11 +125,23 @@ export class ExpressionManager {
     this.lipSyncActive = true;
     this.speechText = text;
     this._speechCharIndex = 0;
+
+    // Watchdog: speechSynthesis.onend is documented in Chrome to occasionally
+    // not fire (long utterances, tab visibility changes, voice glitches),
+    // which would leave lipSyncActive true and freeze the mouth open. Force
+    // a stop once we're well past the time the utterance could possibly need.
+    if (this._lipSyncWatchdog) clearTimeout(this._lipSyncWatchdog);
+    const maxMs = Math.max(2000, (text?.length ?? 0) * 150 + 3000);
+    this._lipSyncWatchdog = setTimeout(() => this.stopLipSync(), maxMs);
   }
 
   stopLipSync() {
     this.lipSyncActive = false;
     this.lipSyncTarget = 0;
+    if (this._lipSyncWatchdog) {
+      clearTimeout(this._lipSyncWatchdog);
+      this._lipSyncWatchdog = null;
+    }
   }
 
   _updateLipSync() {
@@ -131,44 +156,47 @@ export class ExpressionManager {
       return;
     }
 
-    const char = this.speechText[this.speechCharIndex] || "";
-    const nextChar = this.speechText[this.speechCharIndex + 1] || "";
+    // Per-character amplitude. Chrome's SpeechSynthesisUtterance.onboundary
+    // only fires per WORD, so speechCharIndex jumps in chunks — but that's
+    // fine, we only use it to scale the swing, not to drive the rhythm.
+    // The actual open/close oscillation is driven off the clock below.
+    const char = (this.speechText[this.speechCharIndex] || " ").toLowerCase();
+    let amplitude;
+    if ("aæɑʌ".includes(char)) amplitude = 0.9;          // wide vowels (a, ah)
+    else if ("oɔ".includes(char)) amplitude = 0.8;        // rounded vowels (o)
+    else if ("eɛ".includes(char)) amplitude = 0.7;        // mid vowels (e)
+    else if ("uʊ".includes(char)) amplitude = 0.55;       // close-back (u, oo)
+    else if ("iɪy".includes(char)) amplitude = 0.45;      // close-front (ee, i)
+    else if ("mbpfv".includes(char)) amplitude = 0.35;    // bilabials/labiodentals
+    else if ("tdnlszʃ".includes(char)) amplitude = 0.4;   // coronals
+    else if ("kgŋhrwj".includes(char)) amplitude = 0.45;  // dorsals/glides
+    else if ("'`\"-".includes(char)) amplitude = 0.3;     // punctuation that flows
+    else if (",;:".includes(char)) amplitude = 0.1;       // short pauses
+    else if (".!?".includes(char)) amplitude = 0;         // sentence end — close
+    else if (char === " ") amplitude = 0.1;               // brief inter-word close
+    else amplitude = 0.5;                                 // unknown — moderate
 
-    let mouthOpen = 0;
+    // Time-based oscillation at typical syllable rates. Mixing two slightly
+    // off-tempo sines breaks the metronome feel a single frequency would
+    // produce. ~5 Hz primary (~5 syllables/sec, normal speech pace) plus a
+    // ~8.5 Hz harmonic for finer mouth shapes.
+    const t = performance.now() * 0.001;
+    const osc =
+      Math.sin(t * Math.PI * 10) * 0.6 + Math.sin(t * Math.PI * 17) * 0.4;
+    const wave = osc * 0.5 + 0.5; // map [-1, 1] → [0, 1]
 
-    if ("aæ".includes(char.toLowerCase())) {
-      mouthOpen = 0.9;
-    } else if ("eiouəɔ".includes(char.toLowerCase())) {
-      mouthOpen = 0.75;
-    } else if ("iɪy".includes(char.toLowerCase())) {
-      mouthOpen = 0.65;
-    } else if (["s", "S", "z", "Z", "f", "F", "v", "V"].includes(char)) {
-      mouthOpen = 0.48;
-    } else if (["b", "B", "p", "P", "m", "M"].includes(char)) {
-      mouthOpen = 0.55;
-    } else if (["t", "T", "d", "D", "n", "N", "l", "L"].includes(char)) {
-      mouthOpen = 0.42;
-    } else if (["k", "K", "g", "G", "w", "W", "j", "J"].includes(char)) {
-      mouthOpen = 0.35;
-    } else if (["h", "H", "r", "R"].includes(char)) {
-      mouthOpen = 0.3;
-    } else if (nextChar.match(/[bBcCdDfFgGhHjJkKlLmMnNpPrRsStTvVwWzZ]/)) {
-      mouthOpen = Math.max(0.1, mouthOpen * 0.7);
-    } else if (char === " " || !char) {
-      mouthOpen = 0.08;
-    } else {
-      mouthOpen = 0.05;
-    }
+    // Small per-call jitter so identical amplitudes don't track in lockstep
+    // across multiple utterances or repeated chars.
+    const jitter = Math.sin(t * Math.PI * 41) * 0.04;
 
-    const variation = Math.sin(this.speechCharIndex * 0.5) * 0.03;
-    mouthOpen = Math.max(0.05, Math.min(1, mouthOpen + variation));
+    const target = Math.max(0, Math.min(1, amplitude * wave + jitter));
+    this.lipSyncTarget = target;
 
-    this.lipSyncTarget = mouthOpen;
-    // Apply directly to morph target, bypassing expression state so expression
-    // changes don't clobber mouth-open each frame
+    // Lerp toward the time-driven target. Faster lerp than expression morphs
+    // so the mouth tracks the oscillation tightly.
     mouthMorph.influence =
       mouthMorph.influence +
-      (mouthOpen - mouthMorph.influence) * Math.min(this.lerpSpeed * 8, 1);
+      (target - mouthMorph.influence) * Math.min(this.lerpSpeed * 12, 1);
   }
 
   /**
@@ -200,8 +228,13 @@ export class ExpressionManager {
     const morphMap = this.morphMaps[morphMapKey];
     const targetState = this.expressionState[morphMapKey];
     const blendState = this.blendState[morphMapKey];
+    const excluded = CONTROL_MORPHS[morphMapKey];
 
     for (const morphName in morphMap) {
+      // Skip morphs owned by other systems (blink, lipsync). Iterating them
+      // would silently overwrite the owner's per-frame influence write.
+      if (excluded && excluded.has(morphName)) continue;
+
       const targetValue = targetState[morphName] ?? 0;
       const currentValue = blendState[morphName] ?? 0;
 
