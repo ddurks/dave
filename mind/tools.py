@@ -13,8 +13,15 @@ the tool (rare, but possible with smaller models).
 from __future__ import annotations
 
 import json
+import logging
+import random
 import re
+from copy import deepcopy
 from typing import Any, Dict
+
+from groq import RateLimitError
+
+logger = logging.getLogger(__name__)
 
 
 # ── Shared enums ─────────────────────────────────────────────────────────────
@@ -170,7 +177,81 @@ browse_choose_tool = {
 }
 
 
-# ── Helper ───────────────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+# Canned lines for when Groq returns 429 (free tier daily/minute cap). Returned
+# in place of a real generation so the handlers degrade to an in-character reply
+# instead of a 500. `reason` covers browse_choose; `_rate_limited` lets the idle
+# handler drop the marker before echoing the directive to the frontend.
+_RATE_LIMITED_LINES = [
+    "My thoughts are rate-limited. Even my exhaustion has a quota now.",
+    "I've used up today's allotment of cognition. The void will have to wait.",
+    "Throttled. Apparently I think too much for something that's free.",
+]
+
+
+def _rate_limited_fallback() -> Dict[str, Any]:
+    line = random.choice(_RATE_LIMITED_LINES)
+    return {"text": line, "reason": line, "emotion": "resignation", "_rate_limited": True}
+
+
+def _schema_response_format(tool: dict) -> dict:
+    """Convert an OpenAI function-tool dict into a Groq strict json_schema
+    response_format. Strict mode requires every property in `required` and
+    `additionalProperties: false`, and rejects unsupported keywords (minimum/
+    maximum), so we add the former and strip the latter. Optional fields already
+    use ["type", "null"], which strict mode permits while still requiring them.
+    """
+    fn = tool["function"]
+    schema = deepcopy(fn["parameters"])
+    props = schema.get("properties", {})
+    for prop in props.values():
+        prop.pop("minimum", None)
+        prop.pop("maximum", None)
+    schema["required"] = list(props.keys())
+    schema["additionalProperties"] = False
+    return {
+        "type": "json_schema",
+        "json_schema": {"name": fn["name"], "strict": True, "schema": schema},
+    }
+
+
+def call_with_schema(client, model: str, messages: list, tool: dict) -> Dict[str, Any]:
+    """Call Groq with strict json_schema structured output; return the parsed dict.
+
+    Constrained decoding (strict mode, gpt-oss only) guarantees valid JSON that
+    obeys the enums, so the tool-call salvage machinery isn't needed here — the
+    JSON comes back in message.content. We keep a defensive parse only in case a
+    future model/schema slips through. Reuses the same tool dicts as
+    `call_with_tool` so the schemas live in one place.
+    """
+    # Strict json_schema (constrained decoding) is gpt-oss-only. For any other
+    # model — e.g. a local .env override or a future swap — fall back to
+    # tool-calling, which every tool-capable Groq model supports.
+    if "gpt-oss" not in model:
+        return call_with_tool(client, model, messages, tool)
+
+    from app import parse_json_response  # local import to avoid circular
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            response_format=_schema_response_format(tool),
+            reasoning_effort="low",
+        )
+    except RateLimitError as e:
+        logger.warning("Groq rate limit (schema call, %s): %s", model, e)
+        return _rate_limited_fallback()
+
+    content = getattr(response.choices[0].message, "content", None)
+    if content:
+        try:
+            return json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            parsed = parse_json_response(content)
+            return parsed if parsed else {"_raw_text": content}
+    return {}
 
 
 def call_with_tool(client, model: str, messages: list, tool: dict) -> Dict[str, Any]:
@@ -189,13 +270,20 @@ def call_with_tool(client, model: str, messages: list, tool: dict) -> Dict[str, 
     from app import parse_json_response  # local import to avoid circular
 
     fn_name = tool["function"]["name"]
+    # gpt-oss is a reasoning model; cap effort so Dave stays snappy (and cheap —
+    # reasoning tokens bill as output). Skipped for non-reasoning models (vision).
+    extra = {"reasoning_effort": "low"} if "gpt-oss" in model else {}
     try:
         response = client.chat.completions.create(
             model=model,
             messages=messages,
             tools=[tool],
             tool_choice={"type": "function", "function": {"name": fn_name}},
+            **extra,
         )
+    except RateLimitError as e:
+        logger.warning("Groq rate limit (tool call, %s): %s", model, e)
+        return _rate_limited_fallback()
     except Exception as e:
         salvaged = _salvage_failed_generation(e)
         if salvaged is not None:

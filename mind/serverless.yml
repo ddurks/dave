@@ -8,15 +8,6 @@ provider:
   region: us-east-1
   memorySize: 512
   timeout: 30
-  environment:
-    # SSM SecureString — resolved (KMS-decrypted) at DEPLOY time and baked
-    # into the Lambda environment. Rotate via `aws ssm put-parameter` +
-    # redeploy.
-    GROQ_API_KEY: ${ssm:/dave/groq-api-key}
-    GROQ_MODEL: llama-3.1-8b-instant
-    # SSM SecureString — same pattern as GROQ_API_KEY. Create with:
-    # aws ssm put-parameter --name /dave/pexels-api-key --value "YOUR_KEY" --type SecureString
-    PEXELS_API_KEY: ${ssm:/dave/pexels-api-key}
 
 custom:
   customDomain:
@@ -41,6 +32,25 @@ custom:
 functions:
   query:
     handler: app.lambda_handler
+    # Scoped to this function rather than `provider` so the publicly-invokable
+    # videoproxy Function URL doesn't inherit the API keys.
+    environment:
+      # SSM SecureString — resolved (KMS-decrypted) at DEPLOY time and baked
+      # into the Lambda environment. Rotate via `aws ssm put-parameter` +
+      # redeploy.
+      GROQ_API_KEY: ${ssm:/dave/groq-api-key}
+      GROQ_MODEL: openai/gpt-oss-20b
+      # SSM SecureString — same pattern as GROQ_API_KEY. Create with:
+      # aws ssm put-parameter --name /dave/pexels-api-key --value "YOUR_KEY" --type SecureString
+      PEXELS_API_KEY: ${ssm:/dave/pexels-api-key}
+      # Wired to the videoproxy Function URL so Internet Archive videos are served
+      # with CORS headers (the TV's canvas can't read non-CORS media). Resolved at
+      # deploy time; an empty value would simply disable IA → Wikimedia/Pexels.
+      VIDEO_PROXY_BASE:
+        Fn::GetAtt: [VideoproxyLambdaFunctionUrl, FunctionUrl]
+    package:
+      patterns:
+        - "!videoproxy.js"
     events:
       - http:
           path: query
@@ -50,6 +60,21 @@ functions:
           path: health
           method: get
           cors: true
+
+  # CORS streaming proxy for Internet Archive videos. A Lambda Function URL in
+  # RESPONSE_STREAM mode — API Gateway can't stream and caps payloads at ~10 MB,
+  # so video must bypass it. Node runtime (response streaming is Node-native);
+  # zero npm deps. Locked to archive.org in the handler. See videoproxy.js.
+  videoproxy:
+    handler: videoproxy.handler
+    runtime: nodejs22.x
+    timeout: 300
+    url:
+      invokeMode: RESPONSE_STREAM
+    package:
+      patterns:
+        - "!**"
+        - videoproxy.js
 
 plugins:
   - serverless-python-requirements

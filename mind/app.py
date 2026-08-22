@@ -12,6 +12,7 @@ import random
 from datetime import datetime
 from typing import Dict, Any, Optional
 from html.parser import HTMLParser
+from urllib.parse import quote
 import requests as http_requests
 from dotenv import load_dotenv
 
@@ -22,6 +23,7 @@ from flask_cors import CORS
 
 from tools import (
     call_with_tool,
+    call_with_schema,
     respond_tool,
     idle_tool,
     browse_react_tool,
@@ -48,9 +50,13 @@ logger = logging.getLogger(__name__)
 # ── Configuration ────────────────────────────────────────────────────────────
 
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
-GROQ_MODEL = os.environ.get('GROQ_MODEL', 'llama-3.1-8b-instant')
+GROQ_MODEL = os.environ.get('GROQ_MODEL', 'openai/gpt-oss-20b')
 GROQ_VISION_MODEL = os.environ.get('GROQ_VISION_MODEL', 'meta-llama/llama-4-scout-17b-16e-instruct')
 PEXELS_API_KEY = os.environ.get('PEXELS_API_KEY')
+# CORS proxy base URL (e.g. a Cloudflare Worker) used to re-serve Internet
+# Archive videos with CORS headers so the TV's canvas texture can read them.
+# Empty → Internet Archive is skipped and the TV falls back to Wikimedia/Pexels.
+VIDEO_PROXY_BASE = os.environ.get('VIDEO_PROXY_BASE', '').rstrip('/')
 PORT = int(os.environ.get('PORT', 3000))
 
 # Wikimedia's User-Agent policy requires a descriptive UA with a contact URL
@@ -202,7 +208,7 @@ def handle_respond(body: Dict[str, Any]) -> Dict[str, Any]:
 
         messages.append({"role": "user", "content": user_input})
 
-        data = call_with_tool(get_groq_client(), GROQ_MODEL, messages, respond_tool)
+        data = call_with_schema(get_groq_client(), GROQ_MODEL, messages, respond_tool)
 
         if not data.get("text") and data.get("_raw_text"):
             data = validate_response(data["_raw_text"])
@@ -261,7 +267,7 @@ def handle_idle(body: Dict[str, Any]) -> Dict[str, Any]:
     user_msg = f"{context_line}\nWhat should D.A.V.E. do now?".strip()
 
     try:
-        directive = call_with_tool(
+        directive = call_with_schema(
             get_groq_client(),
             GROQ_MODEL,
             [
@@ -271,13 +277,16 @@ def handle_idle(body: Dict[str, Any]) -> Dict[str, Any]:
             idle_tool,
         )
 
-        # Belt-and-suspenders sanitize (tool schema already enforces enum, but
-        # the fallback path or a misbehaving model could slip through).
+        # Belt-and-suspenders sanitize (strict schema already enforces enum, but
+        # the rate-limit fallback or a misbehaving model could slip through).
         directive.pop("_raw_text", None)
+        directive.pop("_rate_limited", None)
         if directive.get("action") not in ["wander", "idle", "sit", "laydown", "look-around"]:
             directive["action"] = "wander"
-        if not isinstance(directive.get("durationSec"), (int, float)) or directive.get("durationSec", 0) < 5:
-            directive["durationSec"] = 40
+        # Schema no longer caps durationSec (strict mode drops minimum/maximum),
+        # so clamp to the intended 10–60s range here.
+        dur = directive.get("durationSec")
+        directive["durationSec"] = int(max(10, min(60, dur))) if isinstance(dur, (int, float)) else 40
 
         return {"directive": directive}, 200
     except Exception as e:
@@ -314,20 +323,26 @@ def _generate_search_query(groq_client, model: str, hour: int) -> Optional[str]:
         period = "evening"
     else:
         period = "late night"
+    # gpt-oss reasons before answering and bills reasoning against the token
+    # budget, so a tight cap (the old 12) would be spent thinking and leave
+    # content empty. Use low effort + ample headroom; the prompt keeps it terse.
+    params = dict(
+        model=model,
+        messages=[
+            {"role": "system", "content": (
+                "You are D.A.V.E. — a sardonic, world-weary AI watching videos alone. "
+                "Given a time of day, reply with ONLY a 2-4 word Pexels video search query "
+                "that fits your current dim, contemplative vibe. No explanation, no quotes."
+            )},
+            {"role": "user", "content": f"It is {period}. What will you watch?"},
+        ],
+        max_tokens=256,
+        temperature=1.1,
+    )
+    if "gpt-oss" in model:
+        params["reasoning_effort"] = "low"
     try:
-        resp = groq_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": (
-                    "You are D.A.V.E. — a sardonic, world-weary AI watching videos alone. "
-                    "Given a time of day, reply with ONLY a 2-4 word Pexels video search query "
-                    "that fits your current dim, contemplative vibe. No explanation, no quotes."
-                )},
-                {"role": "user", "content": f"It is {period}. What will you watch?"},
-            ],
-            max_tokens=12,
-            temperature=1.1,
-        )
+        resp = groq_client.chat.completions.create(**params)
         query = resp.choices[0].message.content.strip().strip('"').strip("'")
         return query if query else None
     except Exception as e:
@@ -455,6 +470,86 @@ def _fetch_wikimedia_video(search_query: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+# Internet Archive collections with a dim, contemplative, faintly absurd streak
+# — public-domain ephemera and old film that suit D.A.V.E.'s aesthetic.
+_ARCHIVE_COLLECTIONS = ["prelinger", "classic_tv", "feature_films", "more_animation"]
+
+
+def _proxy_wrap(direct_url: str) -> Optional[str]:
+    """Wrap a non-CORS direct media URL with the configured video proxy so the
+    TV's canvas texture can read its pixels. None when no proxy is set."""
+    if not VIDEO_PROXY_BASE:
+        return None
+    return f"{VIDEO_PROXY_BASE}/?u={quote(direct_url, safe='')}"
+
+
+def _fetch_archive_video() -> Optional[Dict[str, Any]]:
+    """Pick an interesting public-domain video from the Internet Archive.
+
+    IA serves direct MP4s but no CORS headers, so the URL is wrapped with
+    VIDEO_PROXY_BASE. Without a proxy configured this returns None and the
+    caller falls back to Wikimedia/Pexels.
+    """
+    if not VIDEO_PROXY_BASE:
+        return None
+    headers = {"User-Agent": WIKIMEDIA_UA}
+    try:
+        q = f"collection:({random.choice(_ARCHIVE_COLLECTIONS)}) AND mediatype:(movies)"
+        search_params = {"q": q, "fl[]": ["identifier", "title"], "output": "json"}
+
+        # Probe the count, then jump to a random page so we sample the whole
+        # collection rather than always its first results.
+        probe = http_requests.get(
+            "https://archive.org/advancedsearch.php",
+            params={**search_params, "rows": 0}, headers=headers, timeout=8,
+        )
+        probe.raise_for_status()
+        num = probe.json().get("response", {}).get("numFound", 0)
+        if not num:
+            return None
+        page = random.randint(1, max(1, min(num // 30, 300)))
+        resp = http_requests.get(
+            "https://archive.org/advancedsearch.php",
+            params={**search_params, "rows": 30, "page": page}, headers=headers, timeout=8,
+        )
+        resp.raise_for_status()
+        docs = resp.json().get("response", {}).get("docs", [])
+        random.shuffle(docs)
+
+        for doc in docs[:10]:
+            identifier = doc.get("identifier")
+            if not identifier:
+                continue
+            meta = http_requests.get(
+                f"https://archive.org/metadata/{identifier}", headers=headers, timeout=8,
+            )
+            meta.raise_for_status()
+            m = meta.json()
+            server, directory = m.get("server"), m.get("dir")
+            if not server or not directory:
+                continue
+            # Pick the smallest real MP4 derivative (cheapest to proxy/stream),
+            # preferring IA's low-bitrate "_512kb.mp4" when present.
+            mp4s = [f for f in m.get("files", [])
+                    if str(f.get("name", "")).lower().endswith(".mp4") and int(f.get("size") or 0) > 0]
+            if not mp4s:
+                continue
+            mp4s.sort(key=lambda f: int(f.get("size") or 0))
+            name = next((f["name"] for f in mp4s if "512kb" in f["name"]), mp4s[0]["name"])
+            proxied = _proxy_wrap(f"https://{server}{directory}/{name}")
+            if not proxied:
+                return None
+            return {
+                "videoUrl": proxied,
+                "title": (doc.get("title") or identifier)[:80],
+                "description": "From the Internet Archive.",
+            }
+        return None
+    except Exception as e:
+        logger.warning(f"Internet Archive fetch failed: {e}")
+        return None
+
+
 def handle_watch_tv(body: Dict[str, Any]) -> Dict[str, Any]:
     """Watch a short video on the TV: fetch from Pexels or Wikimedia Commons and react to it."""
     groq = get_groq_client()
@@ -462,18 +557,19 @@ def handle_watch_tv(body: Dict[str, Any]) -> Dict[str, Any]:
     search_query = _generate_search_query(groq, GROQ_MODEL, hour)
     fallback_query = search_query or random.choice(_PEXELS_SEARCH_QUERIES)
 
-    # ~40% Wikimedia, ~60% Pexels — each falls back to the other
-    if random.random() < 0.4:
-        media = _fetch_wikimedia_video(fallback_query) or _fetch_pexels_video(search_query=search_query)
-    else:
-        media = _fetch_pexels_video(search_query=search_query) or _fetch_wikimedia_video(fallback_query)
+    # Internet Archive (interesting) → Wikimedia → Pexels (fallback only).
+    media = (
+        _fetch_archive_video()
+        or _fetch_wikimedia_video(fallback_query)
+        or _fetch_pexels_video(search_query=search_query)
+    )
 
     if not media:
         return {"videoUrl": None, "pageTitle": "tv: no signal", "response": None}, 200
 
     try:
         page_content = f'Video: "{media["title"]}"\n\n{media["description"]}'
-        react = call_with_tool(
+        react = call_with_schema(
             groq,
             GROQ_MODEL,
             [
@@ -653,7 +749,7 @@ def handle_browse(body: Dict[str, Any]) -> Dict[str, Any]:
             if is_followup else
             "D.A.V.E. is reading a random Wikipedia article"
         )
-        react = call_with_tool(
+        react = call_with_schema(
             groq,
             GROQ_MODEL,
             [
@@ -764,7 +860,7 @@ def handle_browse_choose(body: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     try:
-        choice = call_with_tool(
+        choice = call_with_schema(
             get_groq_client(),
             GROQ_MODEL,
             [
@@ -816,7 +912,7 @@ def handle_muse(body: Dict[str, Any]) -> Dict[str, Any]:
         prompt = random.choice(MUSE_PROMPTS)
         musing_context = f"{MUSE_PREAMBLE}\n\n{prompt}"
     try:
-        data = call_with_tool(
+        data = call_with_schema(
             get_groq_client(),
             GROQ_MODEL,
             [
@@ -995,7 +1091,7 @@ def handle_browse_url(body: Dict[str, Any]) -> Dict[str, Any]:
 
     # ── LLM reaction ──────────────────────────────────────────────────────
     try:
-        react = call_with_tool(
+        react = call_with_schema(
             get_groq_client(),
             GROQ_MODEL,
             [
