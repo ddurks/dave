@@ -1056,8 +1056,8 @@ async function triggerActivityMuse(context, scheduler) {
     if (!r?.text) return;
     dave.expressionManager.setExpression(r.emotion);
     dave._lockExpression(3000);
-    addMessageToHistory("dave", r.text);
-    await speak(r.text, r.speechRate || 0.85);
+    const spokenMsg = addMessageToHistory("dave", r.text, { reveal: true });
+    await speak(r.text, r.speechRate || 0.85, spokenMsg);
   } catch {
     // silent
   } finally {
@@ -1129,8 +1129,8 @@ async function fetchAndReadArticle(scheduler, { title } = {}) {
   if (scheduler?.aborted) return null;
 
   if (r.text) {
-    addMessageToHistory("dave", r.text);
-    await speak(r.text, r.speechRate || 0.85);
+    const spokenMsg = addMessageToHistory("dave", r.text, { reveal: true });
+    await speak(r.text, r.speechRate || 0.85, spokenMsg);
   }
   dave._lockExpression(4000);
 
@@ -1193,8 +1193,8 @@ async function runBrowseSession(scheduler) {
     if (choiceR?.text) {
       dave.expressionManager.setExpression(choiceR.emotion);
       dave._lockExpression(2500);
-      addMessageToHistory("dave", choiceR.text);
-      await speak(choiceR.text, choiceR.speechRate || 0.95);
+      const spokenMsg = addMessageToHistory("dave", choiceR.text, { reveal: true });
+      await speak(choiceR.text, choiceR.speechRate || 0.95, spokenMsg);
     }
     if (scheduler.aborted || !dave.isBrowsing) return;
 
@@ -1237,8 +1237,8 @@ async function doWatchTv(scheduler) {
     }
     if (scheduler?.aborted) return;
 
-    addMessageToHistory("dave", r.text);
-    await speak(r.text, r.speechRate || 0.85);
+    const spokenMsg = addMessageToHistory("dave", r.text, { reveal: true });
+    await speak(r.text, r.speechRate || 0.85, spokenMsg);
 
     dave._lockExpression(4000);
   } catch (err) {
@@ -1395,8 +1395,8 @@ window._dave = dave;
 // Dave fires passive speech (linger notices, directive grumbles) through here.
 dave.onMutter = async (text) => {
   if (!text || isBusy || dave.isMusing) return;
-  addMessageToHistory("dave", text);
-  await speak(text, 0.95);
+  const spokenMsg = addMessageToHistory("dave", text, { reveal: true });
+  await speak(text, 0.95, spokenMsg);
 };
 
 // ── Wire up browsing callbacks to Dave instance ───────────────────────────
@@ -1497,20 +1497,23 @@ pipBox.addEventListener("click", () => {
 // ── Speech (Web Speech API) ──────────────────────────────────────────────
 // (Expression, blink, and lip sync all managed by Dave class)
 
-function speak(text, rate) {
+// `msg` is the history entry for this line (from addMessageToHistory with
+// reveal), whose bubble fills in word by word as Dave says each one.
+function speak(text, rate, msg = null) {
   return new Promise((resolve) => {
     if (isMuted || !("speechSynthesis" in window)) {
       dave.expressionManager.startLipSync(text);
       const durationMs = (text.length * 60) / rate;
       const msPerChar = durationMs / Math.max(text.length, 1);
       for (let i = 0; i < text.length; i++) {
-        setTimeout(
-          () => (dave.expressionManager.speechCharIndex = i),
-          i * msPerChar,
-        );
+        setTimeout(() => {
+          dave.expressionManager.speechCharIndex = i;
+          revealWordAt(msg, i);
+        }, i * msPerChar);
       }
       setTimeout(() => {
         dave.expressionManager.stopLipSync();
+        finishReveal(msg);
         resolve();
       }, durationMs);
       return;
@@ -1531,18 +1534,41 @@ function speak(text, rate) {
       utt.voice = preferred;
     }
 
+    // Some voices (Chrome's network voices among them) never fire
+    // onboundary. Until the first boundary arrives, pace the reveal at the
+    // muted path's estimate so the bubble doesn't sit empty the whole line.
+    let paceTimer = null;
+    const stopPacing = () => {
+      clearInterval(paceTimer);
+      paceTimer = null;
+    };
     utt.onstart = () => {
       dave.expressionManager.startLipSync(text);
+      if (!msg) return;
+      const started = performance.now();
+      const msPerChar = 60 / rate;
+      paceTimer = setInterval(() => {
+        const i = Math.floor((performance.now() - started) / msPerChar);
+        revealWordAt(msg, Math.min(i, text.length - 1));
+      }, 50);
     };
-    utt.onboundary = (e) =>
-      (dave.expressionManager.speechCharIndex = e.charIndex);
+    utt.onboundary = (e) => {
+      dave.expressionManager.speechCharIndex = e.charIndex;
+      if (e.name && e.name !== "word") return;
+      stopPacing();
+      revealWordAt(msg, e.charIndex);
+    };
     utt.onend = () => {
+      stopPacing();
       dave.expressionManager.stopLipSync();
+      finishReveal(msg);
       resolve();
     };
     utt.onerror = (err) => {
+      stopPacing();
       handleError("speak", err);
       dave.expressionManager.stopLipSync();
+      finishReveal(msg);
       resolve();
     };
     speechSynthesis.speak(utt);
@@ -1629,8 +1655,8 @@ document.addEventListener("visibilitychange", () => {
         if (!isBusy && !dave.isMusing) {
           dave.triggerMuse(ctxStr).then((r) => {
             if (r?.text) {
-              addMessageToHistory("dave", r.text);
-              speak(r.text, 1.0);
+              const spokenMsg = addMessageToHistory("dave", r.text, { reveal: true });
+              speak(r.text, 1.0, spokenMsg);
             }
           });
         }
@@ -1714,6 +1740,10 @@ const historyToggle = document.getElementById("historyToggle");
 
 let historyOpen = false;
 let sessionMessages = [];
+// Dave lines still being spoken: message -> how many characters are shown.
+// In memory only, so a reload shows every line in full.
+const revealing = new Map();
+const bubbleEls = new Map();
 
 // Load session history from localStorage
 try {
@@ -1738,7 +1768,9 @@ function formatTime(date) {
   return `${hours}:${mins}`;
 }
 
-function addMessageToHistory(sender, text) {
+// Pass { reveal: true } for a line that speak() will say; its bubble starts
+// empty and fills in as each word is spoken. Returns the message for speak().
+function addMessageToHistory(sender, text, { reveal = false } = {}) {
   // Validate and trim text
   const cleanText = String(text || "").trim();
   if (!cleanText) {
@@ -1751,6 +1783,7 @@ function addMessageToHistory(sender, text) {
     timestamp: new Date().toISOString(),
   };
   sessionMessages.push(msg);
+  if (reveal) revealing.set(msg, 0);
 
   // Log for debugging
   // (removed verbose logging)
@@ -1779,10 +1812,34 @@ function addMessageToHistory(sender, text) {
   setTimeout(() => {
     historyPanel.scrollTop = historyPanel.scrollHeight;
   }, 0);
+  return msg;
+}
+
+function setRevealed(msg, chars) {
+  if (!msg || !revealing.has(msg) || chars <= revealing.get(msg)) return;
+  revealing.set(msg, chars);
+  const el = bubbleEls.get(msg);
+  if (!el) return;
+  el.textContent = msg.text.slice(0, chars);
+  historyPanel.scrollTop = historyPanel.scrollHeight;
+}
+
+// Show everything through the end of the word that starts at charIndex.
+function revealWordAt(msg, charIndex) {
+  if (!msg || !revealing.has(msg)) return;
+  const end = msg.text.slice(charIndex).search(/\s/);
+  setRevealed(msg, end === -1 ? msg.text.length : charIndex + end);
+}
+
+function finishReveal(msg) {
+  if (!msg || !revealing.has(msg)) return;
+  setRevealed(msg, msg.text.length);
+  revealing.delete(msg);
 }
 
 function renderSessionHistory() {
   historyPanel.innerHTML = "";
+  bubbleEls.clear();
 
   if (sessionMessages.length === 0) {
     return;
@@ -1797,7 +1854,10 @@ function renderSessionHistory() {
 
     const bubbleDiv = document.createElement("div");
     bubbleDiv.className = "messageBubble";
-    bubbleDiv.textContent = msg.text;
+    bubbleDiv.textContent = revealing.has(msg)
+      ? msg.text.slice(0, revealing.get(msg))
+      : msg.text;
+    bubbleEls.set(msg, bubbleDiv);
 
     const timeDiv = document.createElement("div");
     timeDiv.className = "messageTime";
@@ -1962,8 +2022,8 @@ async function submitUrl(url) {
       await new Promise((res) =>
         setTimeout(res, Math.min(r.speechPauseMs, 1500)),
       );
-    addMessageToHistory("dave", r.text);
-    await speak(r.text, r.speechRate || 0.85);
+    const spokenMsg = addMessageToHistory("dave", r.text, { reveal: true });
+    await speak(r.text, r.speechRate || 0.85, spokenMsg);
     dave._lockExpression(4000);
   } catch (err) {
     handleError("browseUrl", err);
@@ -2030,8 +2090,8 @@ async function submitMedia(file) {
       await new Promise((res) =>
         setTimeout(res, Math.min(r.speechPauseMs, 1500)),
       );
-    addMessageToHistory("dave", r.text);
-    await speak(r.text, r.speechRate || 0.85);
+    const spokenMsg = addMessageToHistory("dave", r.text, { reveal: true });
+    await speak(r.text, r.speechRate || 0.85, spokenMsg);
     dave._lockExpression(4000);
   } catch (err) {
     handleError("media", err);
@@ -2092,8 +2152,8 @@ async function sendMessage() {
       await new Promise((resolve) => setTimeout(resolve, r.speechPauseMs));
     }
 
-    addMessageToHistory("dave", r.text);
-    await speak(r.text, r.speechRate || 0.85);
+    const spokenMsg = addMessageToHistory("dave", r.text, { reveal: true });
+    await speak(r.text, r.speechRate || 0.85, spokenMsg);
 
     // If the LLM directed Dave to move to furniture, go immediately
     if (r.moveTo && furnitureByName[r.moveTo]) {
@@ -2239,8 +2299,8 @@ async function handleDaveTap() {
   if (contextStr) {
     const response = await dave.triggerMuse(contextStr);
     if (response && response.text) {
-      addMessageToHistory("dave", response.text);
-      await speak(response.text, 1.0);
+      const spokenMsg = addMessageToHistory("dave", response.text, { reveal: true });
+      await speak(response.text, 1.0, spokenMsg);
     }
   }
 }
