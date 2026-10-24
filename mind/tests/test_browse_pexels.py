@@ -155,9 +155,12 @@ def _wiki_response(title="Test Article", extract="Some interesting facts."):
 
 
 def test_watch_tv_calls_pexels_and_returns_video(stub_groq, monkeypatch):
-    """handle_watch_tv should call _fetch_pexels_video and return videoUrl."""
+    """When Archive and Wikimedia come up empty, handle_watch_tv falls back to Pexels."""
     # Stub _generate_search_query so the test doesn't need a real Groq call shape.
     monkeypatch.setattr(app, "_generate_search_query", lambda *a, **kw: "ocean waves")
+    # Pexels is the last resort; stub the earlier sources so no network is hit.
+    monkeypatch.setattr(app, "_fetch_archive_video", lambda: None)
+    monkeypatch.setattr(app, "_fetch_wikimedia_video", lambda q: None)
 
     pexels_called = []
 
