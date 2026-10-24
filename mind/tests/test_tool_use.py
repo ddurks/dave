@@ -104,3 +104,31 @@ def test_call_with_tool_salvages_bad_request(stub_groq, monkeypatch):
         tools.respond_tool,
     )
     assert result == {"text": "hello", "emotion": "melancholy"}
+
+
+def test_call_with_schema_salvages_tool_call_envelope():
+    """gpt-oss in strict mode sometimes emits a tool call; Groq 400s it. Recover the args."""
+    exc = _FakeBadRequest({
+        "error": {
+            "message": "Tool choice is none, but model called a tool",
+            "code": "tool_use_failed",
+            "failed_generation": (
+                '{"name": "respond", "arguments": {"text":"Because the universe '
+                'forgot to make a pause button.","emotion":"existential-dread",'
+                '"gesture":null,"posture":null,"gaze":null,"moveTo":null}}'
+            ),
+        }
+    })
+
+    class _Client:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kwargs):
+                    raise exc
+
+    result = tools.call_with_schema(
+        _Client, "openai/gpt-oss-20b", [{"role": "user", "content": "hi"}], tools.respond_tool
+    )
+    assert result["text"] == "Because the universe forgot to make a pause button."
+    assert result["emotion"] == "existential-dread"

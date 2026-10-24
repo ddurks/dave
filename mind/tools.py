@@ -243,6 +243,15 @@ def call_with_schema(client, model: str, messages: list, tool: dict) -> Dict[str
     except RateLimitError as e:
         logger.warning("Groq rate limit (schema call, %s): %s", model, e)
         return _rate_limited_fallback()
+    except Exception as e:
+        # gpt-oss sometimes ignores response_format and emits a tool call
+        # anyway; Groq 400s it ("Tool choice is none, but model called a
+        # tool") with the reply intact in failed_generation.
+        salvaged = _salvage_failed_generation(e)
+        if salvaged is not None:
+            logger.warning("Salvaged failed generation (schema call, %s)", model)
+            return salvaged
+        raise
 
     content = getattr(response.choices[0].message, "content", None)
     if content:
@@ -332,6 +341,9 @@ def _salvage_failed_generation(exc) -> Dict[str, Any] | None:
     payload = (m.group(1) if m else failed_gen).strip()
 
     parsed = parse_json_response(payload)
+    # Unwrap a {"name": ..., "arguments": {...}} tool-call envelope.
+    if isinstance(parsed.get("arguments"), dict) and "name" in parsed:
+        parsed = parsed["arguments"]
     if parsed:
         # Sanitize known-bad values so the handler doesn't have to.
         if parsed.get("emotion") not in EMOTION_ENUM:
