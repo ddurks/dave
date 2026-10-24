@@ -91,7 +91,7 @@ class S3TurnLogger:
 
     def __init__(self, bucket: str, key_prefix: str = "turns/",
                  region: str = "us-east-1",
-                 model: str = "llama-3.1-8b-instant"):
+                 model: str = "claude-opus-5"):
         import boto3  # imported lazily so tests don't need boto3 installed
 
         self._bucket = bucket
