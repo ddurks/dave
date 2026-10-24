@@ -76,6 +76,21 @@ functions:
         - "!**"
         - videoproxy.js
 
+resources:
+  Resources:
+    # AWS now requires public (auth NONE) Function URLs to grant
+    # lambda:InvokeFunction as well as lambda:InvokeFunctionUrl; Serverless v3
+    # only creates the latter, so the URL 403s without this. Scoped to calls
+    # arriving via the Function URL.
+    VideoproxyLambdaPermissionInvokeViaUrl:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName:
+          Fn::GetAtt: [VideoproxyLambdaFunction, Arn]
+        Action: lambda:InvokeFunction
+        Principal: "*"
+        InvokedViaFunctionUrl: true
+
 plugins:
   - serverless-python-requirements
   - serverless-domain-manager
