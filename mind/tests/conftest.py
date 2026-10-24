@@ -1,7 +1,7 @@
 """Test fixtures for D.A.V.E. mind.
 
 This module runs BEFORE any test imports `app`, because:
-1. It sets GROQ_API_KEY/GROQ_MODEL in os.environ (app reads these at import time).
+1. It sets ANTHROPIC_API_KEY in os.environ (app reads these at import time).
 2. It ensures `mind/data/*.json` exists with required keys (app.load_prompts()
    runs at import time and will fail otherwise).
 
@@ -20,8 +20,9 @@ from unittest.mock import MagicMock
 
 # ── Environment setup (must happen before app import) ─────────────────────────
 
-os.environ.setdefault("GROQ_API_KEY", "test")
-os.environ.setdefault("GROQ_MODEL", "test-model")
+os.environ.setdefault("ANTHROPIC_API_KEY", "test")
+os.environ.setdefault("DAVE_MODEL_RESPOND", "claude-opus-5")
+os.environ.setdefault("DAVE_MODEL_BACKGROUND", "claude-haiku-4-5")
 
 # ── Stub data files if missing (must happen before app import) ────────────────
 
@@ -38,7 +39,7 @@ _STUB_BEHAVIOR_PROMPTS = {
     "musePreamble": "test-muse-preamble",
     "idlePrompt": "test-idle-prompt",
     "browsePickPrompt": "test-browse-pick-prompt",
-    "browseReactPrompt": "test-browse-react-prompt",
+    "distillPrompt": "distill", "browseReactPrompt": "test-browse-react-prompt",
 }
 
 # Track files (and dir) we create so we can remove only those at session end.
@@ -93,50 +94,72 @@ def pytest_sessionfinish(session, exitstatus):
 
 
 @pytest.fixture
-def stub_groq(monkeypatch):
-    """Stub app.get_groq_client. Returned object lets tests set response text
-    or structured tool-call arguments.
+def stub_llm(monkeypatch):
+    """Stub app.get_client with a fake Claude client.
+
+    Structured output means the response is always JSON in a text block, so a
+    single setter covers every handler. `set_response` remains for the handful
+    of tests that exercise the non-JSON path.
 
     Usage:
-        def test_x(stub_groq):
-            stub_groq.set_response("hello world")  # plain-text fallback path
-            stub_groq.set_tool_response({"text": "x", "emotion": "boredom"})  # tool-call path
+        def test_x(stub_llm):
+            stub_llm.set_json({"text": "x", "emotion": "boredom"})
+            stub_llm.set_response("not json at all")
     """
 
     class _Stub:
         def __init__(self):
+            self.payload = None
             self.text = ""
-            self.tool_args = None
+            self.calls = []
             self.client = MagicMock()
-            self.client.chat.completions.create = MagicMock(side_effect=self._create)
+            self.client.messages.create = MagicMock(side_effect=self._create)
 
         def _create(self, *args, **kwargs):
+            self.calls.append(kwargs)
+            block = MagicMock()
+            block.type = "text"
+            block.text = json.dumps(self.payload) if self.payload is not None else self.text
             msg = MagicMock()
-            msg.choices = [MagicMock()]
-            if self.tool_args is not None:
-                tool_call = MagicMock()
-                tool_call.function = MagicMock()
-                tool_call.function.arguments = json.dumps(self.tool_args)
-                msg.choices[0].message.tool_calls = [tool_call]
-                msg.choices[0].message.content = None
-            else:
-                msg.choices[0].message.tool_calls = None
-                msg.choices[0].message.content = self.text
+            msg.content = [block]
+            msg.stop_reason = "end_turn"
+            msg.usage = MagicMock(
+                input_tokens=10, output_tokens=10,
+                cache_creation_input_tokens=0, cache_read_input_tokens=0,
+            )
             return msg
 
-        def set_response(self, text: str):
-            """Stub returns plain text (fallback-path testing)."""
-            self.text = text
-            self.tool_args = None
-
-        def set_tool_response(self, args: dict):
-            """Stub returns a tool call with JSON-encoded arguments."""
-            self.tool_args = args
+        def set_json(self, payload: dict):
+            """Stub returns a valid structured-output object."""
+            self.payload = payload
             self.text = ""
 
+        def set_response(self, text: str):
+            """Stub returns plain text (the non-JSON path)."""
+            self.text = text
+            self.payload = None
+
     stub = _Stub()
-    monkeypatch.setattr(app, "get_groq_client", lambda: stub.client)
+    monkeypatch.setattr(app, "get_client", lambda: stub.client)
     return stub
+
+
+@pytest.fixture(autouse=True)
+def isolated_state(tmp_path, monkeypatch):
+    """Point the persistent-state layer at a scratch file per test.
+
+    Mood, memory and the spend ledger are all persistent now, so without this a
+    test could read another test's leftovers -- or worse, a developer's real
+    DynamoDB table.
+    """
+    import state
+    import state_config
+
+    monkeypatch.setattr(state_config, "LOCAL_STATE_PATH", str(tmp_path / "state.json"))
+    monkeypatch.setattr(state, "_store", state.LocalStore(str(tmp_path / "state.json")))
+    monkeypatch.setattr(state, "_backend_name", "local")
+    state._budget_cache.update(month=None, item={}, read_at=0.0, deltas={})
+    yield
 
 
 @pytest.fixture
@@ -149,7 +172,15 @@ def client():
 
 @pytest.fixture(autouse=True)
 def _clear_sessions():
-    """Reset in-memory session store between tests."""
-    app.sessions.clear()
+    """Reset the in-memory session store between tests, if one is wired up.
+
+    app.py stopped holding a session store when handle_respond moved to
+    client-supplied history, so this guards rather than assuming. Persistent
+    state is handled separately by isolated_state.
+    """
+    store = getattr(app, "sessions", None)
+    if store is not None:
+        store.clear()
     yield
-    app.sessions.clear()
+    if store is not None:
+        store.clear()

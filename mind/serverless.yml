@@ -38,9 +38,12 @@ functions:
       # SSM SecureString — resolved (KMS-decrypted) at DEPLOY time and baked
       # into the Lambda environment. Rotate via `aws ssm put-parameter` +
       # redeploy.
-      GROQ_API_KEY: ${ssm:/dave/groq-api-key}
-      GROQ_MODEL: openai/gpt-oss-20b
-      # SSM SecureString — same pattern as GROQ_API_KEY. Create with:
+      ANTHROPIC_API_KEY: ${ssm:/dave/anthropic-api-key}
+      # Pinned here rather than left to app.py's defaults so a deploy is
+      # reproducible: the model in the Lambda is whatever this file says.
+      DAVE_MODEL_RESPOND: claude-opus-5
+      DAVE_MODEL_BACKGROUND: claude-haiku-4-5
+      # SSM SecureString — same pattern as ANTHROPIC_API_KEY. Create with:
       # aws ssm put-parameter --name /dave/pexels-api-key --value "YOUR_KEY" --type SecureString
       PEXELS_API_KEY: ${ssm:/dave/pexels-api-key}
       # Wired to the videoproxy Function URL so Internet Archive videos are served

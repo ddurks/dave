@@ -2,7 +2,6 @@
 
 from unittest.mock import MagicMock
 
-import pytest
 
 import app
 
@@ -154,10 +153,13 @@ def _wiki_response(title="Test Article", extract="Some interesting facts."):
     return mock_resp
 
 
-def test_watch_tv_calls_pexels_and_returns_video(stub_groq, monkeypatch):
-    """handle_watch_tv should call _fetch_pexels_video and return videoUrl."""
-    # Stub _generate_search_query so the test doesn't need a real Groq call shape.
+def test_watch_tv_falls_through_to_pexels_and_returns_video(stub_llm, monkeypatch):
+    """Internet Archive is preferred, then Wikimedia, then Pexels. With the two
+    ahead of it returning nothing, handle_watch_tv should reach Pexels and
+    return its videoUrl."""
     monkeypatch.setattr(app, "_generate_search_query", lambda *a, **kw: "ocean waves")
+    monkeypatch.setattr(app, "_fetch_archive_video", lambda *a, **kw: None)
+    monkeypatch.setattr(app, "_fetch_wikimedia_video", lambda *a, **kw: None)
 
     pexels_called = []
 
@@ -170,7 +172,7 @@ def test_watch_tv_calls_pexels_and_returns_video(stub_groq, monkeypatch):
         }
 
     monkeypatch.setattr(app, "_fetch_pexels_video", fake_pexels)
-    stub_groq.set_tool_response({"text": "Watching the waves.", "emotion": "melancholy"})
+    stub_llm.set_json({"text": "Watching the waves.", "emotion": "melancholy"})
 
     result, status = app.handle_watch_tv({})
     assert status == 200
@@ -178,10 +180,10 @@ def test_watch_tv_calls_pexels_and_returns_video(stub_groq, monkeypatch):
     assert result.get("videoUrl") == "https://example.com/vid.mp4"
 
 
-def test_browse_falls_through_to_wikipedia_when_pexels_returns_none(stub_groq, monkeypatch):
+def test_browse_falls_through_to_wikipedia_when_pexels_returns_none(stub_llm, monkeypatch):
     monkeypatch.setattr(app, "_fetch_pexels_video", lambda **kw: None)
     monkeypatch.setattr(app.http_requests, "get", lambda *a, **kw: _wiki_response())
-    stub_groq.set_tool_response(
+    stub_llm.set_json(
         {"text": "Fascinating.", "emotion": "fleeting-curiosity"}
     )
 
@@ -193,8 +195,8 @@ def test_browse_falls_through_to_wikipedia_when_pexels_returns_none(stub_groq, m
 
 # ── Flask /query integration ──────────────────────────────────────────────────
 
-def test_query_route_respond_returns_200(stub_groq, client):
-    stub_groq.set_tool_response({"text": "Hello.", "emotion": "boredom"})
+def test_query_route_respond_returns_200(stub_llm, client):
+    stub_llm.set_json({"text": "Hello.", "emotion": "boredom"})
     resp = client.post(
         "/query",
         json={"type": "respond", "sessionId": "s", "userInput": "hi"},

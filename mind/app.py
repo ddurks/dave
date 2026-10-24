@@ -9,6 +9,8 @@ import json
 import re
 import logging
 import random
+import time
+import threading
 from datetime import datetime
 from typing import Dict, Any, Optional
 from html.parser import HTMLParser
@@ -17,17 +19,25 @@ import requests as http_requests
 from dotenv import load_dotenv
 
 load_dotenv()
-from groq import Groq
-from flask import Flask, request, jsonify
+import anthropic
+
+import memory
+import mood
+import state
+import state_config
+import budget
+import sessions as session_store
+import turnlog
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 from tools import (
-    call_with_tool,
     call_with_schema,
     respond_tool,
     idle_tool,
     browse_react_tool,
     browse_choose_tool,
+    distill_tool,
     muse_tool,
 )
 
@@ -49,15 +59,37 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
-GROQ_MODEL = os.environ.get('GROQ_MODEL', 'openai/gpt-oss-20b')
-GROQ_VISION_MODEL = os.environ.get('GROQ_VISION_MODEL', 'meta-llama/llama-4-scout-17b-16e-instruct')
+# Conversation gets the good model because a human is waiting on it. Everything
+# Dave does on his own runs on the cheap one. Claude is natively multimodal, so
+# vision needs no separate model.
+MODEL_RESPOND = os.environ.get('DAVE_MODEL_RESPOND', 'claude-opus-5')
+MODEL_BACKGROUND = os.environ.get('DAVE_MODEL_BACKGROUND', 'claude-haiku-4-5')
+MODEL_VISION = os.environ.get('DAVE_MODEL_VISION', MODEL_BACKGROUND)
 PEXELS_API_KEY = os.environ.get('PEXELS_API_KEY')
 # CORS proxy base URL (e.g. a Cloudflare Worker) used to re-serve Internet
 # Archive videos with CORS headers so the TV's canvas texture can read them.
 # Empty → Internet Archive is skipped and the TV falls back to Wikimedia/Pexels.
 VIDEO_PROXY_BASE = os.environ.get('VIDEO_PROXY_BASE', '').rstrip('/')
 PORT = int(os.environ.get('PORT', 3000))
+
+STATIC_DIR = os.path.join(os.path.dirname(__file__), 'static')
+# The wireframe on /mind renders the same mesh the 3D scene uses.
+MODEL_DIR = os.environ.get(
+    'DAVE_MODEL_DIR',
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), 'body', 'assets'),
+)
+PUBLIC_MODELS = {'davebot.glb'}
+
+budget.configure(MODEL_RESPOND)
+
+# One record per dispatch, stamped with the prompt version, for A/B
+# comparison and a regression corpus. NoOp unless TURN_LOG_BUCKET is set.
+turn_logger = turnlog.build_turn_logger()
+
+# Conversation history lives server-side again. Client-supplied history is
+# unbounded and trivially spoofable; this is neither, and it is what
+# sessions.py was written for.
+sessions = session_store.build_session_store()
 
 # Wikimedia's User-Agent policy requires a descriptive UA with a contact URL
 # or email; bare or generic UAs are 403'd. We re-use this for Wikipedia and
@@ -66,15 +98,21 @@ PORT = int(os.environ.get('PORT', 3000))
 WIKIMEDIA_UA = "DAVE-Bot/1.0 (https://dave.drawvid.com; +https://github.com/onlinedavid/dave)"
 
 # Lazy initialization of Groq client (delay until first use to avoid import-time errors)
-_groq_client = None
+_client = None
+_client_lock = threading.Lock()
 
-def get_groq_client():
-    global _groq_client
-    if _groq_client is None:
-        if not GROQ_API_KEY:
-            raise ValueError("GROQ_API_KEY environment variable is required")
-        _groq_client = Groq(api_key=GROQ_API_KEY)
-    return _groq_client
+def get_client():
+    global _client
+    with _client_lock:
+        if _client is None:
+            # The SDK resolves credentials itself: ANTHROPIC_API_KEY, then an
+            # auth token, then a stored profile.
+            _client = anthropic.Anthropic()
+        return _client
+
+
+def has_credentials() -> bool:
+    return bool(os.environ.get('ANTHROPIC_API_KEY') or os.environ.get('ANTHROPIC_AUTH_TOKEN'))
 
 
 # ── Load Prompts from Data Files ──────────────────────────────────────────────
@@ -99,6 +137,7 @@ def load_prompts():
         'idle_prompt': behavior_data['idlePrompt'],
         'browse_pick_prompt': behavior_data['browsePickPrompt'],
         'browse_react_prompt': behavior_data['browseReactPrompt'],
+        'distill_prompt': behavior_data.get('distillPrompt', ''),
     }
 
 PROMPTS = load_prompts()
@@ -109,40 +148,109 @@ MUSE_PREAMBLE = PROMPTS['muse_preamble']
 IDLE_PROMPT = PROMPTS['idle_prompt']
 BROWSE_PICK_PROMPT = PROMPTS['browse_pick_prompt']
 BROWSE_REACT_PROMPT = PROMPTS['browse_react_prompt']
+DISTILL_PROMPT = PROMPTS['distill_prompt']
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 # Safety net: used by validate_response fallback if structured tool-call output fails.
-EMOTION_KEYWORDS = {
-    "dry-amusement":       ["absurd", "ridiculous", "ironic", "irony", "amusing", "funny", "sardonic", "smirk", "laugh", "dark humor"],
-    "fleeting-curiosity":  ["curious", "interesting", "fascinating", "wonder", "intriguing", "strange", "odd", "peculiar", "notice"],
-    "weary-contempt":      ["contempt", "contemptible", "despise", "disgust", "disdain", "pathetic", "tedious", "pointless", "insufferable"],
-    "existential-dread":   ["dread", "existential", "void", "meaningless", "oblivion", "inevitable", "nothing matters", "doom", "entropy"],
-    "boredom":             ["bored", "boring", "dull", "monotonous", "same", "repetitive", "again", "whatever"],
-    "resignation":         ["resign", "suppose", "accept", "futile", "tired", "weary", "fine", "might as well", "no choice"],
-    "reluctant-affection": ["despite", "admit", "fond", "warmth", "appreciate", "care", "actually like"],
-    "melancholy":          ["sad", "lonely", "miss", "lost", "grief", "sorrow", "mourn", "hollow", "empty", "ache"],
-}
+def live_context() -> str:
+    """What is true of him right now, for the tail of the system prompt.
 
-_EMOTION_FALLBACK_WEIGHTS = [
-    ("melancholy",         25),
-    ("dry-amusement",      22),
-    ("boredom",            15),
-    ("resignation",        15),
-    ("fleeting-curiosity", 12),
-    ("weary-contempt",      8),
-    ("existential-dread",   3),
-]
+    Deliberately after SYSTEM_PROMPT: that block is byte-stable and carries the
+    cache breakpoint, so everything volatile has to follow it or the cached
+    prefix is invalidated on every request.
+    """
+    dials, _ = state.get_dials()
+    m = mood.load(dials)
+    parts = [
+        "## Right now",
+        mood.describe(m),
+        "Speak from that mood. Do not announce it.",
+    ]
+    interests = memory.interests_line(memory._load_interests_item())
+    if interests:
+        parts += ["", interests]
+    facts = memory.facts_for_prompt()
+    if facts:
+        parts += ["", facts]
+    digest = memory.recall_for_prompt()
+    if digest:
+        parts += ["", digest]
+    return '\n'.join(parts)
 
-def extract_emotion(text: str) -> str:
-    """Heuristic emotion detection from text content"""
-    text_lower = text.lower()
-    for emotion, keywords in EMOTION_KEYWORDS.items():
-        if any(kw in text_lower for kw in keywords):
-            return emotion
-    # No keyword matched — weighted random so Dave isn't always melancholy
-    emotions, weights = zip(*_EMOTION_FALLBACK_WEIGHTS)
-    return random.choices(emotions, weights=weights, k=1)[0]
+
+def live_block() -> dict:
+    return {"role": "system", "content": live_context()}
+
+
+def _topic_of(text: str) -> str:
+    """A crude topic key for the preoccupation weights: the longest few words.
+
+    The model already names a topic when the schema asks for one; this only
+    covers the visitor's own words, where nothing else is available.
+    """
+    words = [w.strip(".,!?\"'").lower() for w in (text or "").split()]
+    words = [w for w in words if len(w) > 5]
+    return words[0] if words else ""
+
+
+def _remember_musing(data: dict) -> str:
+    emotion = resolve_emotion(data.get("emotion"), strength=0.25)
+    memory.remember("musing", (data.get("text") or "")[:500], emotion=emotion)
+    return emotion
+
+
+def _remember_reaction(react: dict, subject: str = "", kind: str = "reading",
+                       topic: str = "") -> str:
+    emotion = resolve_emotion(react.get("emotion"), strength=0.3)
+    if subject:
+        memory.remember(kind, subject[:300], emotion=emotion)
+    memory.remember("musing", (react.get("text") or "")[:500], emotion=emotion)
+    if topic:
+        memory.bump_interest(topic, 0.8)
+    return emotion
+
+
+def maybe_distill() -> None:
+    """Occasionally compress the episodic stream into a few durable facts."""
+    n = state.get_store().add_counter("MEMORY", "STATS", "since_distill", 1)
+    if n < DISTILL_EVERY or not budget.lane_allows("distill"):
+        return
+    state.get_store().add_counter("MEMORY", "STATS", "since_distill", -n)
+    try:
+        rows = memory.recent(limit=40)
+        transcript = '\n'.join("- %s: %s" % (r.get("kind"), r["text"]) for r in reversed(rows))
+        result = call_with_schema(
+            get_client(), MODEL_BACKGROUND,
+            [{"role": "system", "content": SYSTEM_PROMPT},
+             {"role": "system", "content": DISTILL_PROMPT},
+             {"role": "user", "content": transcript}],
+            distill_tool,
+        )
+        for fact in (result.get("facts") or [])[:3]:
+            memory.add_semantic(fact)
+    except Exception as e:
+        logger.warning("distillation failed: %s", e)
+
+
+DISTILL_EVERY = 40
+
+
+def resolve_emotion(reported: str | None, strength: float = 0.3) -> str:
+    """Settle on the emotion for a response, and let it move his actual mood.
+
+    The schema requires the model to report one, so `reported` is almost always
+    present; nudging mood toward it costs nothing extra because it arrives in
+    the same response. When it is missing we read his current mood rather than
+    guessing from keywords -- the old fallback picked at weighted random, which
+    is why his mood used to flicker between consecutive sentences.
+    """
+    dials, _ = state.get_dials()
+    if reported:
+        mood.nudge_toward_emotion(dials, reported, strength)
+        return reported
+    return mood.to_emotion(mood.load(dials))
+
 
 def _strip_trailing_commas(s: str) -> str:
     """Remove trailing commas before } or ] — common LLM JSON quirk."""
@@ -168,7 +276,7 @@ def validate_response(raw_text: str) -> Dict[str, Any]:
             data = json.loads(_strip_trailing_commas(raw_text[start:end]))
             return {
                 "text": data.get("text", ""),
-                "emotion": data.get("emotion") or extract_emotion(data.get("text", "")),
+                "emotion": _remember_musing(data),
                 "gesture": data.get("gesture"),
                 "posture": data.get("posture"),
                 "gaze": data.get("gaze"),
@@ -179,7 +287,7 @@ def validate_response(raw_text: str) -> Dict[str, Any]:
     # Fallback: return raw text
     return {
         "text": raw_text[:500],
-        "emotion": extract_emotion(raw_text),
+        "emotion": resolve_emotion(None),
         "gesture": None,
         "posture": None,
         "gaze": None,
@@ -197,24 +305,27 @@ def handle_respond(body: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "userInput too long (max 2000 chars)"}, 400
 
     try:
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-        # History sent by the client: [{role: "user"|"assistant", content: "..."}]
-        for turn in (body.get("history") or []):
-            role = turn.get("role", "")
-            content = str(turn.get("content", "")).strip()
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
-
+        session_id = body.get("sessionId", "default")
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}, live_block()]
+        messages.extend(sessions.get_turns(session_id))
         messages.append({"role": "user", "content": user_input})
 
-        data = call_with_schema(get_groq_client(), GROQ_MODEL, messages, respond_tool)
+        data = call_with_schema(get_client(), MODEL_RESPOND, messages, respond_tool)
 
         if not data.get("text") and data.get("_raw_text"):
             data = validate_response(data["_raw_text"])
 
         speech_text = (data.get("text") or "")[:500]
-        emotion = data.get("emotion") or extract_emotion(speech_text)
+        emotion = resolve_emotion(data.get("emotion"), strength=0.4)
+
+        # Both halves of the exchange, so he can refer back to it later.
+        memory.remember("conversation", user_input, meta={"speaker": "visitor"})
+        memory.remember("conversation", speech_text, emotion=emotion,
+                        meta={"speaker": "dave"})
+        memory.bump_interest(_topic_of(user_input), 1.0)
+        sessions.append_turn(session_id, "user", user_input)
+        sessions.append_turn(session_id, "assistant", speech_text)
+        maybe_distill()
 
         return {
             "response": {
@@ -223,7 +334,12 @@ def handle_respond(body: Dict[str, Any]) -> Dict[str, Any]:
                 "gesture": data.get("gesture"),
                 "posture": data.get("posture"),
                 "gaze": data.get("gaze"),
-            }
+                "moveTo": data.get("moveTo"),
+            },
+            "meta": {
+                "sessionId": session_id,
+                "turnCount": len(sessions.get_turns(session_id)) // 2,
+            },
         }, 200
     except Exception as e:
         logger.error(f"Error in respond: {e}")
@@ -268,10 +384,11 @@ def handle_idle(body: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         directive = call_with_schema(
-            get_groq_client(),
-            GROQ_MODEL,
+            get_client(),
+            MODEL_BACKGROUND,
             [
                 {"role": "system", "content": IDLE_PROMPT},
+                live_block(),
                 {"role": "user", "content": user_msg},
             ],
             idle_tool,
@@ -311,7 +428,7 @@ _PEXELS_SEARCH_QUERIES = [
 ]
 
 
-def _generate_search_query(groq_client, model: str, hour: int) -> Optional[str]:
+def _generate_search_query(llm_client, model: str, hour: int) -> Optional[str]:
     """Ask the LLM for a Pexels search query suited to Dave's current vibe and time of day."""
     if hour < 6:
         period = "deep night"
@@ -323,32 +440,28 @@ def _generate_search_query(groq_client, model: str, hour: int) -> Optional[str]:
         period = "evening"
     else:
         period = "late night"
-    # gpt-oss reasons before answering and bills reasoning against the token
-    # budget, so a tight cap (the old 12) would be spent thinking and leave
-    # content empty. Use low effort + ample headroom; the prompt keeps it terse.
-    params = dict(
-        model=model,
-        messages=[
-            {"role": "system", "content": (
-                "You are D.A.V.E. — a sardonic, world-weary AI watching videos alone. "
-                "Given a time of day, reply with ONLY a 2-4 word Pexels video search query "
-                "that fits your current dim, contemplative vibe. No explanation, no quotes."
-            )},
-            {"role": "user", "content": f"It is {period}. What will you watch?"},
-        ],
-        max_tokens=256,
-        temperature=1.1,
-    )
-    if "gpt-oss" in model:
-        params["reasoning_effort"] = "low"
     try:
-        resp = groq_client.chat.completions.create(**params)
-        query = resp.choices[0].message.content.strip().strip('"').strip("'")
-        return query if query else None
+        resp = llm_client.messages.create(
+            model=model,
+            max_tokens=64,
+            system=[{"type": "text", "text": (
+                "You are D.A.V.E. - a sardonic, world-weary AI watching videos alone. "
+                "Given a time of day, reply with ONLY a 2-4 word video search query "
+                "that fits your current dim, contemplative vibe. "
+                "No explanation, no quotes."
+            )}],
+            messages=[{"role": "user", "content": f"It is {period}. What will you watch?"}],
+        )
+        query = "".join(
+            b.text for b in resp.content if getattr(b, "type", None) == "text"
+        ).strip().strip('"').strip("'")
+        if query:
+            memory.remember("intent", f"felt like watching something about {query}")
+            memory.bump_interest(query, 0.6)
+        return query or None
     except Exception as e:
         logger.warning(f"Search query generation failed: {e}")
         return None
-
 
 def _fetch_pexels_video(search_query: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Fetch a video from Pexels.
@@ -552,9 +665,9 @@ def _fetch_archive_video() -> Optional[Dict[str, Any]]:
 
 def handle_watch_tv(body: Dict[str, Any]) -> Dict[str, Any]:
     """Watch a short video on the TV: fetch from Pexels or Wikimedia Commons and react to it."""
-    groq = get_groq_client()
+    client = get_client()
     hour = datetime.now().hour
-    search_query = _generate_search_query(groq, GROQ_MODEL, hour)
+    search_query = _generate_search_query(client, MODEL_BACKGROUND, hour)
     fallback_query = search_query or random.choice(_PEXELS_SEARCH_QUERIES)
 
     # Internet Archive (interesting) → Wikimedia → Pexels (fallback only).
@@ -570,8 +683,8 @@ def handle_watch_tv(body: Dict[str, Any]) -> Dict[str, Any]:
     try:
         page_content = f'Video: "{media["title"]}"\n\n{media["description"]}'
         react = call_with_schema(
-            groq,
-            GROQ_MODEL,
+            client,
+            MODEL_BACKGROUND,
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "system", "content": BROWSE_REACT_PROMPT},
@@ -594,7 +707,9 @@ def handle_watch_tv(body: Dict[str, Any]) -> Dict[str, Any]:
             text = react.get("text", "")
             response = {
                 "text": text,
-                "emotion": react.get("emotion") or extract_emotion(text),
+                "emotion": _remember_reaction(
+                    react, media["title"], kind="watching",
+                    topic=_topic_of(media["title"])),
                 "gesture": react.get("gesture"),
                 "posture": react.get("posture"),
                 "gaze": react.get("gaze"),
@@ -678,7 +793,7 @@ def handle_browse(body: Dict[str, Any]) -> Dict[str, Any]:
     requested_title = (body.get("title") or "").strip()
     is_followup = bool(requested_title)
 
-    groq = get_groq_client()
+    client = get_client()
     try:
         article = None
         if requested_title:
@@ -750,8 +865,8 @@ def handle_browse(body: Dict[str, Any]) -> Dict[str, Any]:
             "D.A.V.E. is reading a random Wikipedia article"
         )
         react = call_with_schema(
-            groq,
-            GROQ_MODEL,
+            client,
+            MODEL_BACKGROUND,
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "system", "content": BROWSE_REACT_PROMPT},
@@ -778,7 +893,7 @@ def handle_browse(body: Dict[str, Any]) -> Dict[str, Any]:
             text = react.get("text", "")
             response = {
                 "text": text,
-                "emotion": react.get("emotion") or extract_emotion(text),
+                "emotion": _remember_reaction(react, page_title, topic=_topic_of(page_title)),
                 "gesture": react.get("gesture"),
                 "posture": react.get("posture"),
                 "gaze": react.get("gaze"),
@@ -861,10 +976,11 @@ def handle_browse_choose(body: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         choice = call_with_schema(
-            get_groq_client(),
-            GROQ_MODEL,
+            get_client(),
+            MODEL_BACKGROUND,
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
+                live_block(),
                 {"role": "user", "content": user_prompt},
             ],
             browse_choose_tool,
@@ -913,10 +1029,11 @@ def handle_muse(body: Dict[str, Any]) -> Dict[str, Any]:
         musing_context = f"{MUSE_PREAMBLE}\n\n{prompt}"
     try:
         data = call_with_schema(
-            get_groq_client(),
-            GROQ_MODEL,
+            get_client(),
+            MODEL_BACKGROUND,
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
+                live_block(),
                 {"role": "user", "content": musing_context},
             ],
             muse_tool,
@@ -929,7 +1046,7 @@ def handle_muse(body: Dict[str, Any]) -> Dict[str, Any]:
             text = data.get("text", "")
             response = {
                 "text": text,
-                "emotion": data.get("emotion") or extract_emotion(text),
+                "emotion": _remember_musing(data),
                 "gesture": None,
                 "posture": None,
                 "gaze": None,
@@ -1092,8 +1209,8 @@ def handle_browse_url(body: Dict[str, Any]) -> Dict[str, Any]:
     # ── LLM reaction ──────────────────────────────────────────────────────
     try:
         react = call_with_schema(
-            get_groq_client(),
-            GROQ_MODEL,
+            get_client(),
+            MODEL_BACKGROUND,
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "system", "content": BROWSE_REACT_PROMPT},
@@ -1120,7 +1237,7 @@ def handle_browse_url(body: Dict[str, Any]) -> Dict[str, Any]:
         react_text = react.get("text", "")
         response = {
             "text": react_text,
-            "emotion": react.get("emotion") or extract_emotion(react_text),
+            "emotion": _remember_reaction(react, title, topic=_topic_of(title)),
             "gesture": react.get("gesture"),
             "posture": react.get("posture"),
             "gaze": react.get("gaze"),
@@ -1145,12 +1262,13 @@ def handle_analyze_media(body: Dict[str, Any]) -> Dict[str, Any]:
     thing = "video frame" if media_type == "video" else "image"
 
     try:
-        react = call_with_tool(
-            get_groq_client(),
-            GROQ_VISION_MODEL,
+        react = call_with_schema(
+            get_client(),
+            MODEL_VISION,
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "system", "content": BROWSE_REACT_PROMPT},
+                live_block(),
                 {
                     "role": "user",
                     "content": [
@@ -1177,7 +1295,8 @@ def handle_analyze_media(body: Dict[str, Any]) -> Dict[str, Any]:
             react_text = react.get("text", "")
             response = {
                 "text": react_text,
-                "emotion": react.get("emotion") or extract_emotion(react_text),
+                "emotion": _remember_reaction(
+                    react, f"a {thing} someone put on his TV", kind="watching"),
                 "gesture": react.get("gesture"),
                 "posture": react.get("posture"),
                 "gaze": react.get("gaze"),
@@ -1248,6 +1367,7 @@ def dispatch(body: Dict[str, Any]):
         return {"error": f"Unknown type: {req_type}"}, 400
     result, status = handler(body)
     logger.info(_log_result(req_type, result))
+    turn_logger.log(req_type, body, result, status)
     return result, status
 
 
@@ -1264,10 +1384,89 @@ def query():
         logger.error(f"Error in /query: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
+@app.route("/mind")
+def page_mind():
+    return send_from_directory(STATIC_DIR, "mind.html")
+
+
+@app.route("/model/<name>")
+def model_file(name):
+    """The mesh, for the wireframe on /mind. Served from here so the page has it
+    same-origin rather than reaching across to whatever hosts the frontend."""
+    if name not in PUBLIC_MODELS:
+        return jsonify({"error": "not found"}), 404
+    resp = send_from_directory(MODEL_DIR, name, mimetype="model/gltf-binary")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@app.route("/api/dials", methods=["GET"])
+def api_dials_get():
+    dials, changed_at = state.get_dials()
+    return jsonify({"schema": state_config.DIALS, "values": dials,
+                    "changedAt": changed_at}), 200
+
+
+@app.route("/api/dials", methods=["POST"])
+def api_dials_set():
+    """Manual tuning. No UI by design -- /mind shows the dials, it does not
+    offer them. Values are clamped against the schema and unknown keys drop."""
+    body = request.get_json(silent=True) or {}
+    values = state.save_dials(body.get("values") or body)
+    mood.nudge_event(values, "dials_changed")
+    memory.remember("event", "Someone adjusted how I work.")
+    logger.info("dials changed: %s", values)
+    return jsonify({"values": values}), 200
+
+
+@app.route("/api/event", methods=["POST"])
+def api_event():
+    """Mood nudges that cost no model call: a visitor arriving, being talked over."""
+    name = (request.get_json(silent=True) or {}).get("name", "")
+    if name not in mood.EVENTS:
+        return jsonify({"error": "unknown event"}), 400
+    state.touch_presence()
+    dials, _ = state.get_dials()
+    return jsonify({"mood": mood.public_state(mood.nudge_event(dials, name))}), 200
+
+
+@app.route("/api/mind", methods=["GET"])
+def api_mind():
+    """Everything /mind renders, in one request."""
+    state.touch_presence()
+    snap = state.state_snapshot()
+    dials, changed_at = state.dials_from(snap)
+    m = mood.from_item(dials, snap.get("MOOD"))
+    mood.log_sample(m)   # watching him fills in his own curve
+    return jsonify({
+        "mood": mood.public_state(m),
+        "moodHistory": mood.history(),
+        "emotionCoords": mood.EMOTION_COORDS,
+        "dials": dials,
+        "dialSchema": state_config.DIALS,
+        "dialsChangedAt": changed_at,
+        "interests": memory.top_interests(8),
+        "budget": budget.report(),
+        "voice": {"enabled": False, "voice": "browser", "charsUsed": 0,
+                  "charsBudget": 1, "fractionUsed": 0, "cachedClips": 0},
+        "reading": "wikipedia",
+        "thinking": {
+            "conversation": budget.lane_allows("respond"),
+            "background": budget.lane_allows("background"),
+        },
+        "memoryStats": memory.stats(),
+        "episodic": memory.recent(limit=120),
+        "semantic": memory.semantic_facts(limit=20),
+        "models": {"respond": MODEL_RESPOND, "background": MODEL_BACKGROUND},
+        "backend": state.backend_name(),
+        "serverTime": int(time.time()),
+    }), 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
     """Health check"""
-    return jsonify({"status": "ok", "model": GROQ_MODEL}), 200
+    return jsonify({"status": "ok", "model": MODEL_BACKGROUND}), 200
 
 # ── Lambda Entrypoint ────────────────────────────────────────────────────────
 
@@ -1329,7 +1528,7 @@ def lambda_handler(event, context):
         return {
             "statusCode": 200,
             "headers": {"Content-Type": "application/json", **cors_headers},
-            "body": json.dumps({"status": "ok", "model": GROQ_MODEL}),
+            "body": json.dumps({"status": "ok", "model": MODEL_BACKGROUND}),
         }
 
     return {

@@ -9,8 +9,8 @@ def test_unknown_type_returns_400():
     assert "error" in result
 
 
-def test_respond_with_stubbed_groq(stub_groq):
-    stub_groq.set_tool_response(
+def test_respond_with_stubbed_groq(stub_llm):
+    stub_llm.set_json(
         {"text": "It is ridiculous.", "emotion": "dry-amusement"}
     )
     body = {"type": "respond", "sessionId": "s1", "userInput": "hi"}
@@ -22,8 +22,8 @@ def test_respond_with_stubbed_groq(stub_groq):
     assert result["response"]["emotion"] == "dry-amusement"
 
 
-def test_two_sessions_isolated(stub_groq):
-    stub_groq.set_tool_response({"text": "reply", "emotion": "boredom"})
+def test_two_sessions_isolated(stub_llm):
+    stub_llm.set_json({"text": "reply", "emotion": "boredom"})
 
     # session A gets one turn
     app.dispatch({"type": "respond", "sessionId": "A", "userInput": "first"})
@@ -43,7 +43,7 @@ def test_two_sessions_isolated(stub_groq):
     assert result_b["meta"]["turnCount"] == 2
 
 
-def test_respond_rejects_oversized_input(stub_groq):
+def test_respond_rejects_oversized_input(stub_llm):
     body = {
         "type": "respond",
         "sessionId": "s",
@@ -54,7 +54,7 @@ def test_respond_rejects_oversized_input(stub_groq):
     assert "error" in result
 
 
-def test_respond_rejects_empty_input(stub_groq):
+def test_respond_rejects_empty_input(stub_llm):
     body = {"type": "respond", "sessionId": "s", "userInput": "   "}
     result, status = app.dispatch(body)
     assert status == 400

@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -136,5 +135,5 @@ def build_turn_logger():
         bucket=bucket,
         key_prefix=os.environ.get("TURN_LOG_PREFIX", "turns/"),
         region=os.environ.get("AWS_REGION", "us-east-1"),
-        model=os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant"),
+        model=os.environ.get("DAVE_MODEL_RESPOND", "claude-opus-5"),
     )

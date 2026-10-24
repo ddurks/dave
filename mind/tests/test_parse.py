@@ -1,6 +1,7 @@
 """Tests for parse_json_response() and validate_response()."""
 
 import app
+import mood
 
 
 # ── parse_json_response ──────────────────────────────────────────────────────
@@ -40,22 +41,19 @@ def test_validate_standard_payload():
     assert "subEmotion" not in result
 
 
-def test_validate_missing_emotion_falls_back_to_extract():
-    # "ridiculous" → dry-amusement via EMOTION_KEYWORDS.
+def test_validate_missing_emotion_reads_current_mood():
+    # The keyword table is gone: a missing emotion now reads his actual mood
+    # rather than being guessed from the words in the text.
     raw = '{"text": "this is ridiculous"}'
     result = app.validate_response(raw)
     assert result["text"] == "this is ridiculous"
-    assert result["emotion"] == "dry-amusement"
+    assert result["emotion"] in mood.EMOTION_COORDS
 
 
 def test_validate_broken_text_returns_fallback_dict():
-    raw = "completely unparseable nonsense with no json"
-    result = app.validate_response(raw)
-    valid_emotions = (
-        set(app.EMOTION_KEYWORDS.keys())
-        | {e for e, _ in app._EMOTION_FALLBACK_WEIGHTS}
-    )
-    assert result["emotion"] in valid_emotions
-    assert result["text"] == raw[:500]
-    assert "subEmotion" not in result
-    assert result["gesture"] is None
+    """Unparseable text still yields a usable response object; the emotion comes
+    from his current mood rather than from scanning the text for keywords."""
+    result = app.validate_response("not json at all, just prose")
+    assert result["text"]
+    assert result["emotion"] in mood.EMOTION_COORDS
+    assert set(result) >= {"text", "emotion", "gesture", "posture", "gaze"}

@@ -15,9 +15,9 @@ def test_noop_logger_default(monkeypatch):
     tl.log("respond", {"sessionId": "s"}, {"response": {}}, 200)
 
 
-def test_dispatch_calls_turn_logger(stub_groq, monkeypatch):
+def test_dispatch_calls_turn_logger(stub_llm, monkeypatch):
     """dispatch() invokes turn_logger.log() exactly once per call."""
-    stub_groq.set_tool_response({"text": "hi", "emotion": "boredom"})
+    stub_llm.set_json({"text": "hi", "emotion": "boredom"})
     mock_log = MagicMock()
     monkeypatch.setattr(app.turn_logger, "log", mock_log)
 

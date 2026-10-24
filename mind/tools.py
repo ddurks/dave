@@ -1,13 +1,23 @@
-"""Tool/function-call schemas for Groq structured output.
+"""Response schemas and the one place this project talks to Claude.
 
-The Groq Python SDK is OpenAI-compatible, so we use OpenAI's function-calling
-shape. Each schema corresponds to one of the four request handlers in app.py
-(respond, idle, browse-react, muse). The schema enforces the response shape
-at the API layer, eliminating fragile regex/JSON scraping from plain text.
+The schemas are still written in OpenAI function-calling shape because that is
+where they started and every handler already speaks it. `_claude_schema`
+translates one into the json_schema Claude's structured output takes, so the
+schemas stay the single source of truth and the handlers stay unchanged.
 
-`call_with_tool` is a thin helper: it makes a tool-forced API call, parses the
-JSON arguments, and falls back to text parsing if the model declines to use
-the tool (rare, but possible with smaller models).
+Structured output is constrained decoding: the response is always valid JSON
+obeying the enums. That removes the whole salvage layer the previous Groq
+implementation needed for a small model that sometimes malformed its own tool
+calls -- no `<function=>` scraping, no text-parsing fallback.
+
+Two shapes need translating on the way through:
+
+  - `{"type": ["string", "null"], "enum": [...]}`. Claude rejects a union type
+    declared alongside an enum outright. Nullable enums become a plain enum with
+    a "none" member, mapped back to None on the way out.
+  - OpenAI puts system messages in the messages array; Claude takes them as a
+    separate argument. `_split_system` does that, and keeps a cache breakpoint
+    on the first block so the persona bills at cache-read rates.
 """
 
 from __future__ import annotations
@@ -15,11 +25,12 @@ from __future__ import annotations
 import json
 import logging
 import random
-import re
 from copy import deepcopy
 from typing import Any, Dict
 
-from groq import RateLimitError
+import anthropic
+
+import budget
 
 logger = logging.getLogger(__name__)
 
@@ -177,17 +188,42 @@ browse_choose_tool = {
 }
 
 
+distill_tool = {
+    "type": "function",
+    "function": {
+        "name": "distill",
+        "description": "Compress recent memories into a few durable conclusions.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "facts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "At most three conclusions, one sentence each.",
+                },
+            },
+            "required": ["facts"],
+        },
+    },
+}
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-# Canned lines for when Groq returns 429 (free tier daily/minute cap). Returned
-# in place of a real generation so the handlers degrade to an in-character reply
-# instead of a 500. `reason` covers browse_choose; `_rate_limited` lets the idle
-# handler drop the marker before echoing the directive to the frontend.
+# Canned lines for when the model is unavailable -- provider overload, or the
+# monthly ceiling reached. Returned in place of a real generation so handlers
+# degrade to an in-character reply instead of a 500. `reason` covers
+# browse_choose; `_rate_limited` lets the idle handler drop the marker before
+# echoing the directive to the frontend.
 _RATE_LIMITED_LINES = [
     "My thoughts are rate-limited. Even my exhaustion has a quota now.",
-    "I've used up today's allotment of cognition. The void will have to wait.",
-    "Throttled. Apparently I think too much for something that's free.",
+    "I have used up this month's allotment of cognition. The void will have to wait.",
+    "Throttled. Apparently I think too much for something that is free.",
 ]
+
+# The sentinel that stands in for null inside an enum, since Claude will not
+# accept a nullable type declared alongside one.
+NONE_SENTINEL = "none"
 
 
 def _rate_limited_fallback() -> Dict[str, Any]:
@@ -195,169 +231,140 @@ def _rate_limited_fallback() -> Dict[str, Any]:
     return {"text": line, "reason": line, "emotion": "resignation", "_rate_limited": True}
 
 
-def _schema_response_format(tool: dict) -> dict:
-    """Convert an OpenAI function-tool dict into a Groq strict json_schema
-    response_format. Strict mode requires every property in `required` and
-    `additionalProperties: false`, and rejects unsupported keywords (minimum/
-    maximum), so we add the former and strip the latter. Optional fields already
-    use ["type", "null"], which strict mode permits while still requiring them.
+def _claude_schema(tool: dict) -> dict:
+    """Translate an OpenAI function-tool dict into Claude structured output.
+
+    Strict decoding wants every property required and no extras. Nullable enums
+    are collapsed to a plain enum carrying a "none" member, and numeric bounds
+    are dropped -- they are advisory in the prompt anyway and the handlers
+    already clamp what comes back.
     """
     fn = tool["function"]
     schema = deepcopy(fn["parameters"])
     props = schema.get("properties", {})
+
     for prop in props.values():
         prop.pop("minimum", None)
         prop.pop("maximum", None)
+
+        enum = prop.get("enum")
+        if enum is not None and None in enum:
+            prop["enum"] = [e for e in enum if e is not None] + [NONE_SENTINEL]
+            prop["type"] = "string"
+        elif enum is not None and isinstance(prop.get("type"), list):
+            # An enum with a union type but no null member: the union is noise.
+            prop["type"] = next((t for t in prop["type"] if t != "null"), "string")
+
     schema["required"] = list(props.keys())
     schema["additionalProperties"] = False
-    return {
-        "type": "json_schema",
-        "json_schema": {"name": fn["name"], "strict": True, "schema": schema},
-    }
+    return schema
+
+
+def _denull(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Map the enum sentinel back to None so handlers see what they expect."""
+    return {k: (None if v == NONE_SENTINEL else v) for k, v in data.items()}
+
+
+def _to_claude_content(content):
+    """OpenAI content blocks to Claude ones. Only images differ in practice."""
+    if isinstance(content, str):
+        return content
+    blocks = []
+    for block in content:
+        if block.get("type") == "image_url":
+            url = block.get("image_url", {}).get("url", "")
+            if url.startswith("data:"):
+                header, _, payload = url.partition(",")
+                media_type = header.split(";")[0][5:] or "image/jpeg"
+                blocks.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": payload},
+                })
+            else:
+                blocks.append({"type": "image", "source": {"type": "url", "url": url}})
+        else:
+            blocks.append(block)
+    return blocks
+
+
+def _split_system(messages: list):
+    """Claude takes system content as its own argument, not as messages.
+
+    The first system block carries the cache breakpoint: it is the persona,
+    byte-stable across every request, so it bills at cache-read rates after the
+    first call.
+    """
+    system, rest = [], []
+    for m in messages:
+        if m.get("role") == "system":
+            system.append({"type": "text", "text": m["content"]})
+        else:
+            rest.append({"role": m["role"], "content": _to_claude_content(m["content"])})
+    if system:
+        system[0]["cache_control"] = {"type": "ephemeral"}
+    return system, rest
+
+
+# Only the Opus/Sonnet 5 generation accepts output_config.effort; Haiku 4.5
+# rejects it with a 400.
+_EFFORT_MODELS = {"claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7"}
+
+# Models that think leave less of max_tokens for the answer, and thinking counts
+# against it -- too tight a ceiling truncates the JSON mid-object. max_tokens is
+# a cap, not a reservation, so unused headroom costs nothing.
+_MAX_TOKENS = {"thinking": 2048, "plain": 1024}
 
 
 def call_with_schema(client, model: str, messages: list, tool: dict) -> Dict[str, Any]:
-    """Call Groq with strict json_schema structured output; return the parsed dict.
+    """Call Claude with structured output; return the parsed dict.
 
-    Constrained decoding (strict mode, gpt-oss only) guarantees valid JSON that
-    obeys the enums, so the tool-call salvage machinery isn't needed here — the
-    JSON comes back in message.content. We keep a defensive parse only in case a
-    future model/schema slips through. Reuses the same tool dicts as
-    `call_with_tool` so the schemas live in one place.
+    Same signature as the Groq version it replaces, so every handler call site
+    is unchanged.
     """
-    # Strict json_schema (constrained decoding) is gpt-oss-only. For any other
-    # model — e.g. a local .env override or a future swap — fall back to
-    # tool-calling, which every tool-capable Groq model supports.
-    if "gpt-oss" not in model:
-        return call_with_tool(client, model, messages, tool)
-
-    from app import parse_json_response  # local import to avoid circular
-
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            response_format=_schema_response_format(tool),
-            reasoning_effort="low",
-        )
-    except RateLimitError as e:
-        logger.warning("Groq rate limit (schema call, %s): %s", model, e)
+    ok, why = budget.allows(model)
+    if not ok:
+        logger.info("refusing %s call: %s", model, why)
         return _rate_limited_fallback()
 
-    content = getattr(response.choices[0].message, "content", None)
-    if content:
-        try:
-            return json.loads(content)
-        except (json.JSONDecodeError, ValueError):
-            parsed = parse_json_response(content)
-            return parsed if parsed else {"_raw_text": content}
-    return {}
+    system, rest = _split_system(messages)
+    thinks = model in _EFFORT_MODELS
 
+    output_config: Dict[str, Any] = {
+        "format": {"type": "json_schema", "schema": _claude_schema(tool)}
+    }
+    if thinks:
+        # Low effort keeps latency and spend down without the failure modes that
+        # come with disabling thinking outright on Opus 5.
+        output_config["effort"] = "low"
 
-def call_with_tool(client, model: str, messages: list, tool: dict) -> Dict[str, Any]:
-    """Call Groq with a forced tool choice; return the parsed argument dict.
-
-    Falls back to text parsing if the model produced plain text instead of a
-    tool call (rare under tool_choice="required", but possible). If even the
-    text fallback yields nothing, returns {} and lets the caller decide what
-    to do (handlers have their own safety nets).
-
-    Small Llama models occasionally emit invalid tool args (values outside an
-    enum, prose wrapped in <function=name>...</function>, etc.). Groq 400s
-    these but includes the model's output in `failed_generation`; we salvage
-    it so a flaky tool-call doesn't propagate as a 500.
-    """
-    from app import parse_json_response  # local import to avoid circular
-
-    fn_name = tool["function"]["name"]
-    # gpt-oss is a reasoning model; cap effort so Dave stays snappy (and cheap —
-    # reasoning tokens bill as output). Skipped for non-reasoning models (vision).
-    extra = {"reasoning_effort": "low"} if "gpt-oss" in model else {}
     try:
-        response = client.chat.completions.create(
+        response = client.messages.create(
             model=model,
-            messages=messages,
-            tools=[tool],
-            tool_choice={"type": "function", "function": {"name": fn_name}},
-            **extra,
+            max_tokens=_MAX_TOKENS["thinking" if thinks else "plain"],
+            system=system,
+            messages=rest,
+            output_config=output_config,
         )
-    except RateLimitError as e:
-        logger.warning("Groq rate limit (tool call, %s): %s", model, e)
+    except anthropic.RateLimitError as e:
+        logger.warning("Claude rate limit (%s): %s", model, e)
         return _rate_limited_fallback()
-    except Exception as e:
-        salvaged = _salvage_failed_generation(e)
-        if salvaged is not None:
-            return salvaged
-        raise
+    except anthropic.APIStatusError as e:
+        logger.error("Claude API error %s (%s): %s", e.status_code, model, e)
+        return _rate_limited_fallback()
+    except anthropic.APIConnectionError as e:
+        logger.error("Claude connection error (%s): %s", model, e)
+        return _rate_limited_fallback()
 
-    message = response.choices[0].message
+    if getattr(response, "stop_reason", None) == "refusal":
+        # He is fed arbitrary text off the internet, so this is reachable.
+        logger.info("Claude declined to generate (%s)", model)
+        return _rate_limited_fallback()
 
-    tool_calls = getattr(message, "tool_calls", None)
-    if tool_calls:
-        try:
-            return json.loads(tool_calls[0].function.arguments)
-        except (json.JSONDecodeError, ValueError, AttributeError):
-            pass
+    budget.record(model, getattr(response, "usage", None))
 
-    # Fallback: model returned text instead of tool call.
-    content = getattr(message, "content", None)
-    if content:
-        parsed = parse_json_response(content)
-        if parsed:
-            return parsed
-        # Last resort: surface raw text so handlers' validate_response can use it.
-        return {"_raw_text": content}
-
-    return {}
-
-
-# Captures the body inside a Llama-style <function=name>...</function> wrapper.
-_FN_TAG_RE = re.compile(r"<function=\w+>\s*(.*?)\s*(?:</function>)?\s*$", re.DOTALL)
-
-
-def _salvage_failed_generation(exc) -> Dict[str, Any] | None:
-    """Best-effort recovery from Groq's tool_use_failed 400.
-
-    Returns a dict the handler can consume (possibly with `_raw_text` for the
-    safety-net path), or None if nothing usable could be extracted.
-    """
-    from app import parse_json_response  # local import to avoid circular
-
-    failed_gen = _extract_failed_generation(exc)
-    if not failed_gen:
-        return None
-
-    # Strip the <function=name>...</function> wrapper if present.
-    m = _FN_TAG_RE.search(failed_gen)
-    payload = (m.group(1) if m else failed_gen).strip()
-
-    parsed = parse_json_response(payload)
-    if parsed:
-        # Sanitize known-bad values so the handler doesn't have to.
-        if parsed.get("emotion") not in EMOTION_ENUM:
-            parsed.pop("emotion", None)
-        if parsed.get("text") in ("null", "None"):
-            parsed["text"] = ""
-        return parsed
-
-    # Plain prose — let the handler's validate_response safety net handle it.
-    return {"_raw_text": payload}
-
-
-def _extract_failed_generation(exc) -> str:
-    """Pull `failed_generation` out of a Groq BadRequestError across SDK versions."""
-    body = getattr(exc, "body", None)
-    if isinstance(body, dict):
-        err = body.get("error")
-        if isinstance(err, dict):
-            gen = err.get("failed_generation")
-            if gen:
-                return gen
-
-    # Fallback: scrape the exception's string form. The SDK formats the body
-    # with single quotes (Python repr), so match both quote styles.
-    s = str(exc)
-    m = re.search(r"['\"]failed_generation['\"]\s*:\s*['\"](.*?)['\"](?=\s*[},])", s, re.DOTALL)
-    if m:
-        return m.group(1)
-    return ""
+    text = next((b.text for b in response.content if getattr(b, "type", None) == "text"), "")
+    try:
+        return _denull(json.loads(text))
+    except (json.JSONDecodeError, ValueError):
+        logger.error("non-JSON despite schema (%s): %.200s", model, text)
+        return {"_raw_text": text}

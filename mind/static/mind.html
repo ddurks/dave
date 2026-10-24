@@ -1,0 +1,800 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>D.A.V.E. // MIND</title>
+    <script src="https://cdn.babylonjs.com/babylon.js"></script>
+    <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
+    <style>
+      :root {
+        --bg: #030805;
+        --grid: rgba(0, 255, 136, 0.045);
+        --panel: rgba(6, 20, 11, 0.72);
+        --line: #133a24;
+        --line-soft: rgba(0, 255, 136, 0.14);
+        --dim: #3f6b50;
+        --mid: #6ba883;
+        --text: #b6e6c6;
+        --accent: #00ff88;
+        --accent2: #00cc6a;
+        --warn: #ffb347;
+        --bad: #ff5f56;
+        --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+      }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html { -webkit-text-size-adjust: 100%; }
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.5;
+        min-height: 100vh;
+        padding: 14px 14px 60px;
+        /* Blueprint grid, then a faint vignette so the corners fall away. */
+        background-image:
+          linear-gradient(var(--grid) 1px, transparent 1px),
+          linear-gradient(90deg, var(--grid) 1px, transparent 1px),
+          radial-gradient(ellipse at 50% 0%, rgba(0, 255, 136, 0.05), transparent 70%);
+        background-size: 32px 32px, 32px 32px, 100% 100%;
+      }
+      /* Scanlines, kept faint enough to read through. */
+      body::after {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        z-index: 100;
+        background: repeating-linear-gradient(
+          0deg, rgba(0, 0, 0, 0.16) 0 1px, transparent 1px 3px);
+        mix-blend-mode: multiply;
+      }
+      .wrap { max-width: 1500px; margin: 0 auto; }
+
+      /* ── Header ─────────────────────────────────────────────── */
+      header {
+        border: 1px solid var(--line);
+        background: var(--panel);
+        padding: 12px 14px;
+        margin-bottom: 12px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px 22px;
+        align-items: baseline;
+        position: relative;
+      }
+      h1 {
+        font-size: 15px;
+        letter-spacing: 3px;
+        color: var(--accent);
+        font-weight: 700;
+        text-shadow: 0 0 12px rgba(0, 255, 136, 0.5);
+      }
+      .tagline { color: var(--dim); font-size: 11px; letter-spacing: 0.5px; }
+      .hdr-stats { margin-left: auto; display: flex; flex-wrap: wrap; gap: 16px; }
+      .hdr-stat { font-size: 11px; color: var(--dim); letter-spacing: 0.5px; }
+      .hdr-stat b { color: var(--mid); font-weight: 400; }
+      .live { color: var(--accent); }
+      .live::before {
+        content: "\25CF";
+        margin-right: 5px;
+        animation: pulse 1.6s ease-in-out infinite;
+      }
+      @keyframes pulse { 50% { opacity: 0.25; } }
+
+      /* ── Panel grid ─────────────────────────────────────────── */
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+        gap: 12px;
+        align-items: start;
+      }
+      .panel {
+        border: 1px solid var(--line);
+        background: var(--panel);
+        padding: 11px 13px 13px;
+        position: relative;
+        min-width: 0; /* lets grid children actually shrink */
+      }
+      /* Blueprint corner ticks. */
+      .panel::before,
+      .panel::after {
+        content: "";
+        position: absolute;
+        width: 7px;
+        height: 7px;
+        border-color: var(--accent2);
+        opacity: 0.55;
+      }
+      .panel::before { top: -1px; left: -1px; border-top: 1px solid; border-left: 1px solid; }
+      .panel::after { bottom: -1px; right: -1px; border-bottom: 1px solid; border-right: 1px solid; }
+      .panel h2 {
+        font-size: 10px;
+        letter-spacing: 2px;
+        text-transform: uppercase;
+        color: var(--accent2);
+        font-weight: 600;
+        margin-bottom: 10px;
+        display: flex;
+        gap: 8px;
+        align-items: baseline;
+        border-bottom: 1px dashed var(--line);
+        padding-bottom: 7px;
+      }
+      .panel h2 .idx { color: var(--dim); }
+      .panel h2 .note {
+        margin-left: auto;
+        color: var(--dim);
+        letter-spacing: 0.5px;
+        text-transform: none;
+        font-size: 10px;
+      }
+      .span2 { grid-column: span 2; }
+      @media (max-width: 640px) { .span2 { grid-column: span 1; } }
+
+      /* ── Wireframe ──────────────────────────────────────────── */
+      #meshBox { position: relative; }
+      #meshCanvas {
+        width: 100%;
+        aspect-ratio: 1 / 1;
+        max-height: 380px;
+        display: block;
+        touch-action: none;
+        outline: none;
+      }
+      .mesh-overlay {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        font-size: 10px;
+        color: var(--dim);
+      }
+      .mesh-overlay span { position: absolute; letter-spacing: 1px; }
+      .crosshair {
+        position: absolute;
+        inset: 14px;
+        border: 1px dashed var(--line-soft);
+        pointer-events: none;
+      }
+      #meshStatus {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        color: var(--dim);
+        font-size: 11px;
+        letter-spacing: 1px;
+        text-align: center;
+        padding: 20px;
+      }
+
+      /* ── Affect matrix ──────────────────────────────────────── */
+      .plane {
+        position: relative;
+        width: 100%;
+        aspect-ratio: 1 / 1;
+        max-height: 300px;
+        border: 1px solid var(--line);
+        background:
+          linear-gradient(var(--line-soft) 1px, transparent 1px),
+          linear-gradient(90deg, var(--line-soft) 1px, transparent 1px),
+          #050f08;
+        background-size: 25% 25%, 25% 25%, 100% 100%;
+      }
+      .plane .axis { position: absolute; background: var(--line); }
+      .plane .axis.h { left: 0; right: 0; top: 50%; height: 1px; }
+      .plane .axis.v { top: 0; bottom: 0; left: 50%; width: 1px; }
+      .anchor {
+        position: absolute;
+        width: 4px;
+        height: 4px;
+        margin: -2px 0 0 -2px;
+        background: var(--line);
+        border-radius: 50%;
+      }
+      .anchor-label {
+        position: absolute;
+        font-size: 8.5px;
+        color: var(--dim);
+        transform: translate(-50%, -50%);
+        white-space: nowrap;
+        letter-spacing: 0.3px;
+        pointer-events: none;
+      }
+      .trail {
+        position: absolute;
+        width: 5px;
+        height: 5px;
+        margin: -2.5px 0 0 -2.5px;
+        border-radius: 50%;
+        background: var(--accent2);
+      }
+      .dot {
+        position: absolute;
+        width: 13px;
+        height: 13px;
+        margin: -6.5px 0 0 -6.5px;
+        border-radius: 50%;
+        background: var(--accent);
+        box-shadow: 0 0 16px 4px rgba(0, 255, 136, 0.55);
+        transition: left 0.9s ease, top 0.9s ease;
+      }
+      .plane-tick {
+        position: absolute;
+        font-size: 8.5px;
+        color: var(--dim);
+        letter-spacing: 1px;
+      }
+      .readout {
+        margin-top: 9px;
+        font-size: 11px;
+        color: var(--mid);
+        border-top: 1px dashed var(--line);
+        padding-top: 8px;
+      }
+      .readout b { color: var(--accent); font-weight: 400; }
+
+      /* ── Charts ─────────────────────────────────────────────── */
+      svg { display: block; width: 100%; overflow: visible; }
+      .legend { display: flex; gap: 14px; font-size: 10px; color: var(--dim); margin-top: 7px; }
+      .legend i { display: inline-block; width: 10px; height: 2px; margin-right: 5px; vertical-align: middle; }
+
+      /* ── Bars ───────────────────────────────────────────────── */
+      .bars { display: flex; flex-direction: column; gap: 7px; }
+      .bar-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; font-size: 11px; }
+      .bar-label { color: var(--mid); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .bar-val { color: var(--dim); font-size: 10px; }
+      .bar-track { grid-column: 1 / -1; height: 5px; background: #071a0f; border: 1px solid var(--line); }
+      .bar-fill { height: 100%; background: var(--accent2); transition: width 0.6s ease; }
+      .bar-fill.hot { background: var(--warn); }
+      .bar-fill.spent { background: var(--bad); }
+
+      /* ── Stat grid ──────────────────────────────────────────── */
+      .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 9px; }
+      .stat { border: 1px solid var(--line); padding: 8px 9px; background: #050f08; }
+      .stat b { display: block; font-size: 17px; color: var(--accent); font-weight: 600; line-height: 1.2; }
+      .stat span { font-size: 9px; color: var(--dim); letter-spacing: 0.8px; text-transform: uppercase; }
+      .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 11px; margin-top: 10px; }
+      .kv dt { color: var(--dim); }
+      .kv dd { color: var(--mid); text-align: right; overflow: hidden; text-overflow: ellipsis; }
+      .ok { color: var(--accent); }
+      .off { color: var(--bad); }
+
+      /* ── Gauges (read-only tuning) ──────────────────────────── */
+      .gauges { display: grid; grid-template-columns: repeat(auto-fit, minmax(74px, 1fr)); gap: 10px; }
+      .gauge { text-align: center; }
+      .gauge svg { margin: 0 auto; width: 100%; max-width: 74px; }
+      .gauge .g-name { font-size: 9px; color: var(--dim); letter-spacing: 0.6px; text-transform: uppercase; margin-top: 2px; }
+      .gauge .g-val { font-size: 13px; color: var(--accent); }
+
+      /* ── Memory stream ──────────────────────────────────────── */
+      .scrollbox {
+        max-height: 420px;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        background: #040d07;
+        padding: 4px 10px;
+        overscroll-behavior: contain;
+        -webkit-overflow-scrolling: touch;
+      }
+      .scrollbox::-webkit-scrollbar { width: 8px; }
+      .scrollbox::-webkit-scrollbar-track { background: #071a0f; }
+      .scrollbox::-webkit-scrollbar-thumb { background: var(--line); }
+      .scrollbox::-webkit-scrollbar-thumb:hover { background: var(--accent2); }
+      .mem { padding: 8px 0; border-bottom: 1px dashed var(--line); }
+      .mem:last-child { border-bottom: none; }
+      .mem-head { display: flex; gap: 8px; align-items: baseline; font-size: 9.5px; margin-bottom: 3px; flex-wrap: wrap; }
+      .tag { letter-spacing: 1px; text-transform: uppercase; border: 1px solid var(--line); padding: 0 5px; color: var(--dim); }
+      .tag.conversation { color: #7fd8ff; border-color: #24596e; }
+      .tag.musing { color: var(--accent); border-color: var(--accent2); }
+      .tag.reading { color: var(--warn); border-color: #6b4a1f; }
+      .tag.event { color: #d98cff; border-color: #4d2a63; }
+      .tag.watching { color: #ff8fa3; border-color: #6b2635; }
+      .tag.intent { color: #b8b0ff; border-color: #3b3670; }
+      .mem-when { color: var(--dim); }
+      .mem-emo { color: var(--dim); margin-left: auto; }
+      .mem-text { font-size: 12px; color: var(--text); word-wrap: break-word; }
+      .fact { padding: 7px 0; border-bottom: 1px dashed var(--line); font-size: 12px; }
+      .fact:last-child { border-bottom: none; }
+      .fact::before { content: "> "; color: var(--accent2); }
+      .empty { color: var(--dim); font-size: 11px; font-style: italic; padding: 10px 0; }
+      footer { margin-top: 14px; text-align: center; font-size: 10px; color: var(--dim); letter-spacing: 1px; }
+      footer a { color: var(--accent2); text-decoration: none; }
+      footer a:hover { color: var(--accent); }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <h1>D.A.V.E. // MIND</h1>
+        <div class="tagline">DIGITAL AUTONOMOUS VIRTUAL ENTITY &mdash; INTERNAL STATE</div>
+        <div class="hdr-stats">
+          <div class="hdr-stat live" id="hLive">LIVE</div>
+          <div class="hdr-stat">STATE <b id="hEmotion">&mdash;</b></div>
+          <div class="hdr-stat">STORE <b id="hBackend">&mdash;</b></div>
+          <div class="hdr-stat">READS <b id="hReading">&mdash;</b></div>
+        </div>
+      </header>
+
+      <div class="grid">
+        <!-- 01 -->
+        <section class="panel" id="meshBox">
+          <h2><span class="idx">[01]</span> Morphology <span class="note" id="meshNote">rest pose</span></h2>
+          <div style="position: relative">
+            <canvas id="meshCanvas"></canvas>
+            <div class="crosshair"></div>
+            <div class="mesh-overlay">
+              <span style="top: 6px; left: 6px">AXIS Y / CONTINUOUS</span>
+              <span style="bottom: 6px; right: 6px" id="meshPoly">&mdash;</span>
+            </div>
+            <div id="meshStatus">INITIALISING GEOMETRY&hellip;</div>
+          </div>
+        </section>
+
+        <!-- 02 -->
+        <section class="panel">
+          <h2><span class="idx">[02]</span> Affect Matrix <span class="note">valence / arousal</span></h2>
+          <div class="plane" id="plane">
+            <div class="axis h"></div>
+            <div class="axis v"></div>
+            <div class="plane-tick" style="top: 4px; left: 50%; transform: translateX(-50%)">AROUSAL +</div>
+            <div class="plane-tick" style="bottom: 4px; left: 50%; transform: translateX(-50%)">AROUSAL &minus;</div>
+            <div class="plane-tick" style="left: 4px; top: 50%; transform: translateY(-50%) rotate(-90deg); transform-origin: left center">VALENCE &minus;</div>
+            <div class="plane-tick" style="right: 4px; top: 50%; transform: translateY(-50%) rotate(90deg); transform-origin: right center">VALENCE +</div>
+          </div>
+          <div class="readout" id="moodReadout">&mdash;</div>
+        </section>
+
+        <!-- 03 -->
+        <section class="panel span2">
+          <h2><span class="idx">[03]</span> Affect Trace <span class="note" id="traceNote">&mdash;</span></h2>
+          <svg id="trace" viewBox="0 0 600 170" preserveAspectRatio="none" style="height: 170px"></svg>
+          <div class="legend">
+            <span><i style="background: #00ff88"></i>valence</span>
+            <span><i style="background: #ffb347"></i>arousal</span>
+            <span style="margin-left: auto" id="traceSpan"></span>
+          </div>
+        </section>
+
+        <!-- 04 -->
+        <section class="panel">
+          <h2><span class="idx">[04]</span> Emotion Spectrum <span class="note">recent memory</span></h2>
+          <div class="bars" id="spectrum"><div class="empty">No affect recorded.</div></div>
+        </section>
+
+        <!-- 05 -->
+        <section class="panel">
+          <h2><span class="idx">[05]</span> Preoccupations <span class="note">decaying</span></h2>
+          <div class="bars" id="interests"><div class="empty">Nothing on his mind.</div></div>
+        </section>
+
+        <!-- 06 -->
+        <section class="panel">
+          <h2><span class="idx">[06]</span> Cognition Budget <span class="note" id="budgetMonth">&mdash;</span></h2>
+          <div class="bars" id="budget"></div>
+          <dl class="kv" id="budgetKv"></dl>
+        </section>
+
+        <!-- 07 -->
+        <section class="panel">
+          <h2><span class="idx">[07]</span> Vitals</h2>
+          <div class="stats" id="vitals"></div>
+          <dl class="kv" id="vitalsKv"></dl>
+        </section>
+
+        <!-- 08 -->
+        <section class="panel">
+          <h2><span class="idx">[08]</span> Tuning <span class="note">read-only</span></h2>
+          <div class="gauges" id="gauges"></div>
+          <dl class="kv" id="tuningKv"></dl>
+        </section>
+
+        <!-- 08b -->
+        <section class="panel">
+          <h2><span class="idx">[09]</span> Appetite <span class="note">watched / sought</span></h2>
+          <div class="scrollbox" style="max-height: 220px" id="appetite">
+            <div class="empty">He has not watched anything yet.</div>
+          </div>
+        </section>
+
+        <!-- 09 -->
+        <section class="panel">
+          <h2><span class="idx">[10]</span> Conclusions <span class="note">self-distilled</span></h2>
+          <div class="scrollbox" style="max-height: 220px" id="facts">
+            <div class="empty">He has not concluded anything yet.</div>
+          </div>
+        </section>
+
+        <!-- 10 -->
+        <section class="panel span2">
+          <h2><span class="idx">[11]</span> Memory Stream <span class="note" id="memNote">&mdash;</span></h2>
+          <div class="scrollbox" id="stream">
+            <div class="empty">Nothing has happened to him yet.</div>
+          </div>
+        </section>
+      </div>
+
+      <footer>
+        ONE D.A.V.E. &mdash; SHARED STATE &mdash;
+        <a href="/health">DIAGNOSTICS</a>
+      </footer>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const EMO_COLORS = {
+        melancholy: "#5b8fd6", boredom: "#6b7a72", resignation: "#7d7f9a",
+        "existential-dread": "#c65b7c", "weary-contempt": "#c98a3f",
+        "dry-amusement": "#00ff88", "fleeting-curiosity": "#4fd6c4",
+        "reluctant-affection": "#9ad67c",
+      };
+      let coords = {};
+
+      const esc = (s) => String(s == null ? "" : s);
+      const pct = (v) => ((v + 1) / 2) * 100;
+
+      function ago(ts, now) {
+        const s = Math.max(1, Math.floor((now || Date.now() / 1000) - ts));
+        if (s < 60) return s + "s";
+        if (s < 3600) return Math.floor(s / 60) + "m";
+        if (s < 86400) return Math.floor(s / 3600) + "h";
+        return Math.floor(s / 86400) + "d";
+      }
+
+      /* ── Affect matrix ─────────────────────────────────────── */
+      let planeBuilt = false;
+      function buildAnchors() {
+        if (planeBuilt || !Object.keys(coords).length) return;
+        const plane = $("plane");
+        for (const [name, [v, a]] of Object.entries(coords)) {
+          const x = pct(v), y = 100 - pct(a);
+          const d = document.createElement("div");
+          d.className = "anchor";
+          d.style.cssText = `left:${x}%;top:${y}%`;
+          const l = document.createElement("div");
+          l.className = "anchor-label";
+          l.textContent = name.replace(/-/g, " ");
+          // Nudge labels inward so they do not clip at the edges.
+          l.style.cssText = `left:${Math.min(88, Math.max(12, x))}%;top:${Math.min(94, Math.max(7, y - 6))}%`;
+          plane.append(d, l);
+        }
+        const dot = document.createElement("div");
+        dot.className = "dot";
+        dot.id = "moodDot";
+        dot.style.cssText = "left:50%;top:50%";
+        plane.append(dot);
+        planeBuilt = true;
+      }
+
+      function renderPlane(mood, history) {
+        buildAnchors();
+        const dot = $("moodDot");
+        if (dot) {
+          dot.style.left = pct(mood.valence) + "%";
+          dot.style.top = 100 - pct(mood.arousal) + "%";
+        }
+        document.querySelectorAll("#plane .trail").forEach((t) => t.remove());
+        const tail = history.slice(-24, -1);
+        tail.forEach((h, i) => {
+          const t = document.createElement("div");
+          t.className = "trail";
+          t.style.cssText =
+            `left:${pct(h.valence)}%;top:${100 - pct(h.arousal)}%;` +
+            `opacity:${(0.06 + (i / tail.length) * 0.5).toFixed(2)}`;
+          $("plane").append(t);
+        });
+        $("moodReadout").innerHTML =
+          `<b>${esc(mood.emotion).replace(/-/g, " ")}</b> &middot; v ${mood.valence.toFixed(2)} ` +
+          `&middot; a ${mood.arousal.toFixed(2)}<br>${esc(mood.description)}`;
+        $("hEmotion").textContent = mood.emotion.replace(/-/g, " ");
+      }
+
+      /* ── Affect trace ──────────────────────────────────────── */
+      function renderTrace(history) {
+        const W = 600, H = 170, PAD = 6;
+        const svg = $("trace");
+        if (history.length < 2) {
+          svg.innerHTML =
+            `<text x="${W / 2}" y="${H / 2}" fill="#3f6b50" font-size="11" ` +
+            `text-anchor="middle" font-family="monospace">AWAITING SAMPLES</text>`;
+          $("traceNote").textContent = `${history.length} sample(s)`;
+          return;
+        }
+        const t0 = history[0].t, t1 = history[history.length - 1].t;
+        const span = Math.max(1, t1 - t0);
+        const x = (t) => PAD + ((t - t0) / span) * (W - PAD * 2);
+        const y = (v) => PAD + ((1 - v) / 2) * (H - PAD * 2);
+        const path = (key) =>
+          history.map((h, i) => `${i ? "L" : "M"}${x(h.t).toFixed(1)},${y(h[key]).toFixed(1)}`).join("");
+
+        let g = "";
+        for (let i = 0; i <= 4; i++) {
+          const yy = PAD + (i / 4) * (H - PAD * 2);
+          g += `<line x1="0" y1="${yy}" x2="${W}" y2="${yy}" stroke="#133a24" stroke-width="1"/>`;
+        }
+        g += `<line x1="0" y1="${y(0)}" x2="${W}" y2="${y(0)}" stroke="#1f5c39" stroke-width="1" stroke-dasharray="4 4"/>`;
+        for (let i = 1; i < 8; i++) {
+          const xx = (i / 8) * W;
+          g += `<line x1="${xx}" y1="0" x2="${xx}" y2="${H}" stroke="#0f2d1c" stroke-width="1"/>`;
+        }
+        const last = history[history.length - 1];
+        svg.innerHTML =
+          g +
+          `<path d="${path("arousal")}" fill="none" stroke="#ffb347" stroke-width="1.5" opacity="0.85"/>` +
+          `<path d="${path("valence")}" fill="none" stroke="#00ff88" stroke-width="1.8"/>` +
+          `<circle cx="${x(last.t).toFixed(1)}" cy="${y(last.valence).toFixed(1)}" r="3.5" fill="#00ff88"/>` +
+          `<circle cx="${x(last.t).toFixed(1)}" cy="${y(last.arousal).toFixed(1)}" r="3" fill="#ffb347"/>` +
+          `<text x="2" y="${y(1) + 9}" fill="#3f6b50" font-size="9" font-family="monospace">+1</text>` +
+          `<text x="2" y="${y(-1) - 3}" fill="#3f6b50" font-size="9" font-family="monospace">-1</text>`;
+        $("traceNote").textContent = `${history.length} samples`;
+        $("traceSpan").textContent = `span ${ago(t0, t1)}`;
+      }
+
+      /* ── Bars ──────────────────────────────────────────────── */
+      function renderBars(host, rows, empty) {
+        if (!rows.length) {
+          host.innerHTML = `<div class="empty">${empty}</div>`;
+          return;
+        }
+        const max = Math.max(...rows.map((r) => r.value)) || 1;
+        host.innerHTML = rows
+          .map(
+            (r) => `
+          <div class="bar-row">
+            <div class="bar-label" style="${r.color ? `color:${r.color}` : ""}">${esc(r.label)}</div>
+            <div class="bar-val">${esc(r.display)}</div>
+            <div class="bar-track">
+              <div class="bar-fill ${r.cls || ""}" style="width:${Math.min(100, (r.value / max) * 100)}%;${
+                r.color ? `background:${r.color}` : ""
+              }"></div>
+            </div>
+          </div>`,
+          )
+          .join("");
+      }
+
+      /* ── Gauges ────────────────────────────────────────────── */
+      function gauge(name, value) {
+        const R = 26, C = Math.PI * R; // half-circle arc length
+        const frac = Math.max(0, Math.min(100, value)) / 100;
+        return `
+          <div class="gauge">
+            <svg viewBox="0 0 64 40">
+              <path d="M6,34 A26,26 0 0,1 58,34" fill="none" stroke="#133a24" stroke-width="5"/>
+              <path d="M6,34 A26,26 0 0,1 58,34" fill="none" stroke="#00cc6a" stroke-width="5"
+                    stroke-dasharray="${(frac * C).toFixed(1)} ${C.toFixed(1)}"/>
+            </svg>
+            <div class="g-val">${value}</div>
+            <div class="g-name">${esc(name)}</div>
+          </div>`;
+      }
+
+      /* ── Render ────────────────────────────────────────────── */
+      function render(d) {
+        coords = d.emotionCoords || coords;
+        renderPlane(d.mood, d.moodHistory || []);
+        renderTrace(d.moodHistory || []);
+
+        $("hBackend").textContent = d.backend;
+        $("hReading").textContent = d.reading;
+
+        // 04 — emotion frequency across what he still remembers
+        const counts = {};
+        for (const m of d.episodic) if (m.emotion) counts[m.emotion] = (counts[m.emotion] || 0) + 1;
+        renderBars(
+          $("spectrum"),
+          Object.entries(counts)
+            .sort((a, b) => b[1] - a[1])
+            .map(([k, v]) => ({
+              label: k.replace(/-/g, " "), value: v, display: v, color: EMO_COLORS[k],
+            })),
+          "No affect recorded.",
+        );
+
+        // 05
+        renderBars(
+          $("interests"),
+          (d.interests || []).map((t) => ({
+            label: t.topic, value: t.weight, display: t.weight.toFixed(2),
+          })),
+          "Nothing on his mind.",
+        );
+
+        // 06
+        const b = d.budget, v = d.voice;
+        const cls = (f) => (f >= 1 ? "spent" : f > 0.8 ? "hot" : "");
+        renderBars($("budget"), [
+          { label: "model spend", value: b.fractionUsed || 0.001,
+            display: `$${b.spentUsd.toFixed(3)} / $${b.budgetUsd.toFixed(2)}`, cls: cls(b.fractionUsed) },
+          { label: "voice characters", value: Math.max(v.fractionUsed, 0.001),
+            display: `${v.charsUsed.toLocaleString()} / ${v.charsBudget.toLocaleString()}`, cls: cls(v.fractionUsed) },
+        ], "");
+        $("budgetMonth").textContent = b.month;
+        const lanes = Object.entries(b.lanes || {})
+          .map(([k, val]) => `<dt>${esc(k)}</dt><dd>$${val.toFixed(4)}</dd>`).join("");
+        $("budgetKv").innerHTML =
+          lanes +
+          `<dt>conversation</dt><dd class="${d.thinking.conversation ? "ok" : "off"}">` +
+          `${d.thinking.conversation ? "AVAILABLE" : "SPENT"}</dd>` +
+          `<dt>background</dt><dd class="${d.thinking.background ? "ok" : "off"}">` +
+          `${d.thinking.background ? "AVAILABLE" : "PAUSED"}</dd>`;
+
+        // 07
+        const st = d.memoryStats;
+        $("vitals").innerHTML =
+          `<div class="stat"><b>${st.stillHeld}</b><span>held</span></div>` +
+          `<div class="stat"><b>${st.forgotten}</b><span>forgotten</span></div>` +
+          `<div class="stat"><b>${st.everRecorded}</b><span>lifetime</span></div>` +
+          `<div class="stat"><b>${(d.semantic || []).length}</b><span>conclusions</span></div>`;
+        $("vitalsKv").innerHTML =
+          `<dt>respond</dt><dd>${esc(d.models.respond)}</dd>` +
+          `<dt>background</dt><dd>${esc(d.models.background)}</dd>` +
+          `<dt>voice</dt><dd class="${v.enabled ? "ok" : "off"}">${v.enabled ? esc(v.voice) : "BROWSER"}</dd>` +
+          `<dt>clips cached</dt><dd>${v.cachedClips}</dd>`;
+
+        // 08 — the dials, shown not offered
+        const ranges = (d.dialSchema || []).filter((x) => x.type === "range");
+        $("gauges").innerHTML = ranges.map((x) => gauge(x.label, d.dials[x.id])).join("");
+        $("tuningKv").innerHTML =
+          `<dt>resting mood</dt><dd>${esc(d.dials.baseline_mood || "").replace(/-/g, " ")}</dd>` +
+          `<dt>reading</dt><dd>${esc((d.dials.interests || []).join(", "))}</dd>` +
+          `<dt>last changed</dt><dd>${d.dialsChangedAt ? ago(d.dialsChangedAt, d.serverTime) + " ago" : "never"}</dd>`;
+
+        // 09 — what he chose to look at, pulled out of the stream
+        const appetite = d.episodic.filter((m) => m.kind === "watching" || m.kind === "intent");
+        $("appetite").innerHTML = appetite.length
+          ? appetite
+              .slice(0, 40)
+              .map(
+                (m) => `<div class="mem">
+                  <div class="mem-head">
+                    <span class="tag ${esc(m.kind)}">${m.kind === "intent" ? "wanted" : "watched"}</span>
+                    <span class="mem-when">${ago(m.ts, d.serverTime)} ago</span>
+                    ${m.emotion ? `<span class="mem-emo">${esc(m.emotion).replace(/-/g, " ")}</span>` : ""}
+                  </div>
+                  <div class="mem-text">${esc(m.text)}</div>
+                </div>`,
+              )
+              .join("")
+          : `<div class="empty">He has not watched anything yet.</div>`;
+
+        // 10
+        $("facts").innerHTML = (d.semantic || []).length
+          ? d.semantic.map((f) => `<div class="fact">${esc(f.text)}</div>`).join("")
+          : `<div class="empty">He has not concluded anything yet.</div>`;
+
+        // 10
+        const label = {
+          conversation: "heard", musing: "thought", reading: "read",
+          watching: "watched", intent: "wanted", event: "event",
+        };
+        $("stream").innerHTML = d.episodic.length
+          ? d.episodic
+              .map((m) => {
+                const who = m.kind === "conversation" && m.meta && m.meta.speaker === "dave" ? "said" : label[m.kind] || m.kind;
+                return `<div class="mem">
+                  <div class="mem-head">
+                    <span class="tag ${esc(m.kind)}">${esc(who)}</span>
+                    <span class="mem-when">${ago(m.ts, d.serverTime)} ago</span>
+                    ${m.emotion ? `<span class="mem-emo">${esc(m.emotion).replace(/-/g, " ")}</span>` : ""}
+                  </div>
+                  <div class="mem-text">${esc(m.text)}</div>
+                </div>`;
+              })
+              .join("")
+          : `<div class="empty">Nothing has happened to him yet.</div>`;
+        $("memNote").textContent = `${d.episodic.length} shown`;
+      }
+
+      /* ── Wireframe ─────────────────────────────────────────── */
+      function initMesh() {
+        const canvas = $("meshCanvas");
+        if (typeof BABYLON === "undefined") {
+          $("meshStatus").textContent = "GEOMETRY UNAVAILABLE";
+          return;
+        }
+        let engine;
+        try {
+          engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: false }, true);
+        } catch (e) {
+          $("meshStatus").textContent = "WEBGL UNAVAILABLE";
+          return;
+        }
+        const scene = new BABYLON.Scene(engine);
+        scene.clearColor = new BABYLON.Color4(0, 0, 0, 0);
+
+        const camera = new BABYLON.ArcRotateCamera(
+          "cam", -Math.PI / 2, Math.PI / 2.35, 6, BABYLON.Vector3.Zero(), scene);
+        camera.attachControl(canvas, true);
+        camera.lowerRadiusLimit = 2;
+        camera.upperRadiusLimit = 20;
+        camera.wheelDeltaPercentage = 0.01;
+        new BABYLON.HemisphericLight("l", new BABYLON.Vector3(0, 1, 0), scene);
+
+        const pivot = new BABYLON.TransformNode("pivot", scene);
+
+        BABYLON.SceneLoader.ImportMeshAsync("", "/model/", "davebot.glb", scene)
+          .then((res) => {
+            // No animation group running leaves the rig in its bind pose.
+            res.animationGroups.forEach((g) => { g.stop(); g.reset(); });
+
+            const wire = new BABYLON.StandardMaterial("wire", scene);
+            wire.wireframe = true;
+            wire.emissiveColor = new BABYLON.Color3(0, 0.85, 0.45);
+            wire.diffuseColor = new BABYLON.Color3(0, 0, 0);
+            wire.specularColor = new BABYLON.Color3(0, 0, 0);
+            wire.disableLighting = true;
+            wire.alpha = 0.65;
+
+            let verts = 0;
+            const meshes = res.meshes.filter((m) => m.getTotalVertices() > 0);
+            meshes.forEach((m) => {
+              m.material = wire;
+              verts += m.getTotalVertices();
+            });
+
+            // Centre and frame whatever the model's own scale happens to be.
+            let min = null, max = null;
+            meshes.forEach((m) => {
+              const bb = m.getBoundingInfo().boundingBox;
+              min = min ? BABYLON.Vector3.Minimize(min, bb.minimumWorld) : bb.minimumWorld.clone();
+              max = max ? BABYLON.Vector3.Maximize(max, bb.maximumWorld) : bb.maximumWorld.clone();
+            });
+            if (min && max) {
+              const centre = min.add(max).scale(0.5);
+              const height = Math.max(max.y - min.y, 0.001);
+              res.meshes.filter((m) => !m.parent).forEach((m) => (m.parent = pivot));
+              pivot.position = centre.scale(-1);
+              camera.setTarget(new BABYLON.Vector3(0, 0, 0));
+              camera.radius = height * 1.9;
+            }
+
+            $("meshStatus").style.display = "none";
+            $("meshPoly").textContent = verts.toLocaleString() + " VERTS";
+          })
+          .catch((err) => {
+            $("meshStatus").textContent = "GEOMETRY FAILED TO LOAD";
+            console.error("[mesh]", err);
+          });
+
+        scene.registerBeforeRender(() => {
+          pivot.rotation.y += 0.004 * scene.getEngine().getDeltaTime() * 0.06;
+        });
+        engine.runRenderLoop(() => scene.render());
+
+        // Only render while on screen; a spinning canvas in a background tab
+        // is pure battery drain on a phone.
+        const io = new IntersectionObserver(
+          ([e]) => (e.isIntersecting && !document.hidden ? engine.runRenderLoop(() => scene.render()) : engine.stopRenderLoop()),
+          { threshold: 0.01 },
+        );
+        io.observe(canvas);
+        document.addEventListener("visibilitychange", () => {
+          if (document.hidden) engine.stopRenderLoop();
+          else engine.runRenderLoop(() => scene.render());
+        });
+        window.addEventListener("resize", () => engine.resize());
+        new ResizeObserver(() => engine.resize()).observe(canvas);
+      }
+
+      /* ── Poll ──────────────────────────────────────────────── */
+      async function refresh() {
+        try {
+          const r = await fetch("/api/mind");
+          if (!r.ok) throw new Error(r.status);
+          render(await r.json());
+          $("hLive").textContent = "LIVE";
+          $("hLive").className = "hdr-stat live";
+        } catch (e) {
+          $("hLive").textContent = "NO SIGNAL";
+          $("hLive").className = "hdr-stat off";
+        }
+      }
+
+      initMesh();
+      refresh();
+      setInterval(() => { if (!document.hidden) refresh(); }, 10000);
+    </script>
+  </body>
+</html>
