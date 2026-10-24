@@ -22,25 +22,21 @@ def test_respond_with_stubbed_groq(stub_groq):
     assert result["response"]["emotion"] == "dry-amusement"
 
 
-def test_two_sessions_isolated(stub_groq):
+def test_respond_forwards_client_history(stub_groq):
     stub_groq.set_tool_response({"text": "reply", "emotion": "boredom"})
 
-    # session A gets one turn
-    app.dispatch({"type": "respond", "sessionId": "A", "userInput": "first"})
-    # session B gets two turns
-    app.dispatch({"type": "respond", "sessionId": "B", "userInput": "one"})
-    result_b, _ = app.dispatch(
-        {"type": "respond", "sessionId": "B", "userInput": "two"}
-    )
+    history = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "reply"},
+        {"role": "system", "content": "ignored: not user/assistant"},
+        {"role": "user", "content": "   "},
+    ]
+    app.dispatch({"type": "respond", "userInput": "two", "history": history})
 
-    # Session A: 1 user + 1 assistant = 2 messages → turnCount=1
-    a_turns = app.sessions.get_turns("A")
-    assert len(a_turns) == 2
-    # Session B: 2 user + 2 assistant = 4 messages → turnCount=2
-    b_turns = app.sessions.get_turns("B")
-    assert len(b_turns) == 4
-    assert result_b["meta"]["sessionId"] == "B"
-    assert result_b["meta"]["turnCount"] == 2
+    messages = stub_groq.client.chat.completions.create.call_args.kwargs["messages"]
+    # system prompt, then valid history turns in order, then the new input
+    assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
+    assert [m["content"] for m in messages[1:]] == ["one", "reply", "two"]
 
 
 def test_respond_rejects_oversized_input(stub_groq):

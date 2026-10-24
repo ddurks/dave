@@ -6,7 +6,7 @@ A 3D AI character you can talk to. Dave wanders his enclosure, sits on the couch
 
 ## How it works
 
-- **mind/** — Python Flask backend wrapping a [Groq](https://groq.com) LLM (Llama 3.1 8B). Four request types: `respond` (user chat), `idle` (autonomous next-action directive), `browse` (read a random Wikipedia article and react), `muse` (internal monologue). The same code runs locally under Flask and in production as an AWS Lambda via the Serverless Framework. The backend is stateless — the client sends recent conversation turns with each `respond` request.
+- **mind/** — Python Flask backend wrapping a [Groq](https://groq.com) LLM (`openai/gpt-oss-20b`, with Llama 4 Scout for vision). Request types include `respond` (user chat), `idle` (autonomous next-action directive), `browse` / `browse_choose` (hop between Wikipedia articles and react), `watchtv` (pick a video for his TV), `analyze_media` (react to an uploaded image) and `muse` (internal monologue). The same code runs locally under Flask and in production as an AWS Lambda via the Serverless Framework. The backend is stateless — the client sends recent conversation turns with each `respond` request.
 - **body/** — Babylon.js scene with Havok physics. Renders Dave, his apartment, the camera-character that watches him, speech bubbles, and the picture-in-picture eye view. Vite for dev/build.
 
 ## Quick start
@@ -21,7 +21,7 @@ You need a [free Groq API key](https://console.groq.com) in `mind/.env`:
 
 ```bash
 GROQ_API_KEY=gsk_...
-GROQ_MODEL=llama-3.1-8b-instant
+GROQ_MODEL=openai/gpt-oss-20b
 PORT=3000
 ```
 

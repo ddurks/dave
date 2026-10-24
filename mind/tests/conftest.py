@@ -146,10 +146,3 @@ def client():
     with app.app.test_client() as c:
         yield c
 
-
-@pytest.fixture(autouse=True)
-def _clear_sessions():
-    """Reset in-memory session store between tests."""
-    app.sessions.clear()
-    yield
-    app.sessions.clear()

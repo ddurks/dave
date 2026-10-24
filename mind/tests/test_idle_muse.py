@@ -29,7 +29,7 @@ def test_idle_context_includes_time_of_day(stub_groq, monkeypatch):
         captured["messages"] = messages
         return {"action": "idle", "emotion": "boredom", "durationSec": 20}
 
-    monkeypatch.setattr(app, "call_with_tool", fake_call_with_tool)
+    monkeypatch.setattr(app, "call_with_schema", fake_call_with_tool)
 
     app.handle_idle({"hourOfDay": 9})
 
@@ -53,7 +53,7 @@ def test_idle_context_time_of_day_various_hours(monkeypatch):
             _captured["messages"] = messages
             return {"action": "wander", "emotion": "boredom", "durationSec": 15}
 
-        monkeypatch.setattr(app, "call_with_tool", fake_call_with_tool)
+        monkeypatch.setattr(app, "call_with_schema", fake_call_with_tool)
         app.handle_idle({"hourOfDay": hour})
         assert expected_label in captured["messages"][1]["content"], (
             f"hour={hour} expected label '{expected_label}'"
@@ -67,7 +67,7 @@ def test_idle_neglect_phase_1(monkeypatch):
         captured["messages"] = messages
         return {"action": "idle", "emotion": "melancholy", "durationSec": 20}
 
-    monkeypatch.setattr(app, "call_with_tool", fake_call)
+    monkeypatch.setattr(app, "call_with_schema", fake_call)
     app.handle_idle({"neglectPhase": 1})
     assert "growing melancholy" in captured["messages"][1]["content"]
 
@@ -79,7 +79,7 @@ def test_idle_neglect_phase_2(monkeypatch):
         captured["messages"] = messages
         return {"action": "laydown", "emotion": "melancholy", "durationSec": 40}
 
-    monkeypatch.setattr(app, "call_with_tool", fake_call)
+    monkeypatch.setattr(app, "call_with_schema", fake_call)
     app.handle_idle({"neglectPhase": 2})
     assert "deeply lethargic" in captured["messages"][1]["content"]
 
@@ -91,7 +91,7 @@ def test_idle_mood_arc_in_context(monkeypatch):
         captured["messages"] = messages
         return {"action": "wander", "emotion": "boredom", "durationSec": 20}
 
-    monkeypatch.setattr(app, "call_with_tool", fake_call)
+    monkeypatch.setattr(app, "call_with_schema", fake_call)
     app.handle_idle({"moodArc": "boredom"})
     assert "boredom" in captured["messages"][1]["content"]
     assert "emotional arc" in captured["messages"][1]["content"]
@@ -110,7 +110,7 @@ def test_idle_returns_safe_default_on_groq_error(monkeypatch):
     def fake_call(client, model, messages, tool):
         raise RuntimeError("Groq exploded")
 
-    monkeypatch.setattr(app, "call_with_tool", fake_call)
+    monkeypatch.setattr(app, "call_with_schema", fake_call)
     result, status = app.handle_idle({})
     # No exception propagated; returns a safe directive
     assert status == 200
@@ -144,13 +144,13 @@ def test_muse_uses_context_override(stub_groq, monkeypatch):
 
     captured = {}
 
-    original_call = app.call_with_tool
+    original_call = app.call_with_schema
 
     def capturing_call(client, model, messages, tool):
         captured["messages"] = messages
         return original_call(client, model, messages, tool)
 
-    monkeypatch.setattr(app, "call_with_tool", capturing_call)
+    monkeypatch.setattr(app, "call_with_schema", capturing_call)
 
     app.handle_muse({"context": "Think about the void."})
 

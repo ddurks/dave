@@ -24,7 +24,7 @@ Create `.env` file:
 
 ```bash
 GROQ_API_KEY=gsk_...
-GROQ_MODEL=llama-3.1-8b-instant
+GROQ_MODEL=openai/gpt-oss-20b
 PORT=3000
 ```
 
@@ -38,6 +38,10 @@ Request types:
 - `"idle"` — Generate idle behavior
 - `"browse"` — Pick URL, fetch, react
 - `"muse"` — Generate idle thought
+- `"browse_choose"` — Pick the next Wikipedia link to follow
+- `"watchtv"` — Pick a video for the TV and react
+- `"browse_url"` — Fetch a given URL and react
+- `"analyze_media"` — React to an uploaded image (vision model)
 
 Example:
 
