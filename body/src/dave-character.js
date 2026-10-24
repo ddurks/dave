@@ -339,6 +339,8 @@ export class Dave {
     this.MODEL_FORWARD_OFFSET = cfg.MODEL.FORWARD_OFFSET;
     this.TURN_SPEED = cfg.MOVEMENT.TURN_SPEED;
     this.MAX_EYE_ANGLE = cfg.GAZE.MAX_EYE_ANGLE;
+    this.MAX_EYE_UP_ANGLE = cfg.GAZE.MAX_EYE_UP_ANGLE;
+    this.EYE_UP_AXIS_LOCAL = BABYLON.Vector3.FromArray(cfg.GAZE.EYE_UP_AXIS_LOCAL);
     this.HEAD_LERP_SPEED = cfg.GAZE.HEAD_LERP_SPEED;
     this.WANDER_BOUNDS = cfg.MOVEMENT.WANDER_BOUNDS;
     this.DAVE_CAPSULE_HEIGHT = cfg.MODEL.CAPSULE_HEIGHT;
@@ -715,7 +717,7 @@ export class Dave {
     );
   }
 
-  computeGazeDelta(baseQuat, fwdAxis, fromPos, toPos, maxAngle, refNode) {
+  computeGazeDelta(baseQuat, fwdAxis, fromPos, toPos, maxAngle, refNode, upLimit = null) {
     const dir = toPos.subtract(fromPos);
     if (dir.lengthSquared() < 0.001) return null;
     dir.normalize();
@@ -736,6 +738,29 @@ export class Dave {
     if (dot < 0) {
       dirLocal = rotatedFwd.clone();
       dot = 1;
+    }
+
+    // Cap elevation above the rest gaze: split the target into its component
+    // along "up" (made perpendicular to the rest forward) and the rest, then
+    // pull it down to at most upLimit.maxAngle above level.
+    if (upLimit) {
+      const up = upLimit.axis.subtract(
+        rotatedFwd.scale(BABYLON.Vector3.Dot(upLimit.axis, rotatedFwd)),
+      );
+      if (up.lengthSquared() > 0.000001) {
+        up.normalize();
+        const rise = BABYLON.Vector3.Dot(dirLocal, up);
+        const maxRise = Math.sin(upLimit.maxAngle);
+        if (rise > maxRise) {
+          const level = dirLocal.subtract(up.scale(rise));
+          if (level.lengthSquared() < 0.000001) level.copyFrom(rotatedFwd);
+          level.normalize();
+          dirLocal = level
+            .scale(Math.cos(upLimit.maxAngle))
+            .add(up.scale(maxRise));
+          dot = clamp(BABYLON.Vector3.Dot(rotatedFwd, dirLocal), -1, 1);
+        }
+      }
     }
 
     let angle = Math.acos(dot);
@@ -857,6 +882,7 @@ export class Dave {
       this.eyeLookAtWorld,
       this.MAX_EYE_ANGLE,
       this.eyeballNodeL,
+      { axis: this.EYE_UP_AXIS_LOCAL, maxAngle: this.MAX_EYE_UP_ANGLE },
     );
     if (!delta) return;
 

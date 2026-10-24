@@ -61,6 +61,11 @@ export const MOVEMENT = {
 // ── Gaze & Head Animation ────────────────────────────────────────────────────
 export const GAZE = {
   MAX_EYE_ANGLE: 0.4, // radians, ~22.9°
+  // Max upward eye pitch above rest. The default lids cover the top half of
+  // the eyeball, so any upward roll would tuck the pupil under them.
+  MAX_EYE_UP_ANGLE: 0,
+  // "Up" for the eyes in their parent bone (upperjaw) space.
+  EYE_UP_AXIS_LOCAL: [0, 0, -1],
   EYE_LERP_SPEED: 1.5,
   MAX_HEAD_ANGLE: 0.45, // radians, ~25.8°
   HEAD_LERP_SPEED: 1.5,
