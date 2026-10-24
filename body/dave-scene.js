@@ -51,6 +51,8 @@ let isMuted = localStorage.getItem(cfg.USER.MUTED_STORAGE_KEY) === "true";
 // ── Engine + Scene ───────────────────────────────────────────────────────
 
 const canvas = document.getElementById("renderCanvas");
+// index.html draws its own loading screens; keep Babylon's logo screen off.
+BABYLON.SceneLoader.ShowLoadingScreen = false;
 const engine = new BABYLON.Engine(canvas, true, {
   preserveDrawingBuffer: true,
 });
@@ -1722,6 +1724,26 @@ scene.onBeforeRenderObservable.add(() => {
 });
 
 engine.runRenderLoop(() => scene.render());
+
+// ── Loading Screens ──────────────────────────────────────────────────────
+// Each view's cover lifts on the first frame its camera renders once every
+// mesh and shader is ready; the chat controls pop up after both.
+scene.executeWhenReady(() => {
+  const covers = new Map([
+    [camera, "loadingMain"],
+    [eyeCam, "loadingPip"],
+  ]);
+  const observer = scene.onAfterCameraRenderObservable.add((cam) => {
+    const id = covers.get(cam);
+    if (!id) return;
+    document.getElementById(id).classList.add("done");
+    covers.delete(cam);
+    if (covers.size === 0) {
+      scene.onAfterCameraRenderObservable.remove(observer);
+      document.body.classList.add("loaded");
+    }
+  });
+});
 
 window.addEventListener("resize", () => {
   // Order matters: engine.resize() must run BEFORE updateViewports() so
