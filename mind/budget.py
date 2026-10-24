@@ -21,7 +21,7 @@ import state_config as config
 
 logger = logging.getLogger(__name__)
 
-_respond_model = "claude-opus-5"
+_respond_model = "claude-opus-5-5"
 
 
 def configure(respond_model: str) -> None:
@@ -78,6 +78,9 @@ def lane_allows(lane: str) -> bool:
 
 
 def allows(model: str):
+    # An unpriced model would meter as $0 and slip past the cap.
+    if model not in config.PRICING:
+        return False, f"no price configured for {model}"
     return lane_status(lane_for(model))
 
 

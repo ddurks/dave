@@ -6,7 +6,7 @@ A 3D AI character you can talk to. Dave wanders his enclosure, sits on the couch
 
 ## How it works
 
-- **mind/** — Python Flask backend wrapping [Claude](https://docs.claude.com) (`claude-opus-5` for chat, `claude-haiku-4-5` for background work and vision). Request types include `respond` (user chat), `idle` (autonomous next-action directive), `browse` / `browse_choose` (hop between Wikipedia articles and react), `watchtv` (pick a video for his TV), `analyze_media` (react to an uploaded image) and `muse` (internal monologue). The same code runs locally under Flask and in production as an AWS Lambda via the Serverless Framework. Conversation turns, mood, and memory are held server-side and keyed by `sessionId`.
+- **mind/** — Python Flask backend wrapping [Claude](https://docs.claude.com) (`claude-opus-5-5` for chat, `claude-haiku-5-5` for background work and vision). Request types include `respond` (user chat), `idle` (autonomous next-action directive), `browse` / `browse_choose` (hop between Wikipedia articles and react), `watchtv` (pick a video for his TV), `analyze_media` (react to an uploaded image) and `muse` (internal monologue). The same code runs locally under Flask and in production as an AWS Lambda via the Serverless Framework. Conversation turns, mood, and memory are held server-side and keyed by `sessionId`.
 - **body/** — Babylon.js scene with Havok physics. Renders Dave, his apartment, the camera-character that watches him, speech bubbles, and the picture-in-picture eye view. Vite for dev/build.
 
 ## Quick start
@@ -24,7 +24,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 PORT=3000
 ```
 
-The models default to `claude-opus-5` and `claude-haiku-4-5`; override with
+The models default to `claude-opus-5-5` and `claude-haiku-5-5`; override with
 `DAVE_MODEL_RESPOND`, `DAVE_MODEL_BACKGROUND`, and `DAVE_MODEL_VISION`.
 
 ## Project layout

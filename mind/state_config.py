@@ -36,6 +36,10 @@ BACKGROUND_CUTOFF = 0.80
 
 # USD per million tokens. Cache writes bill at 1.25x input, reads at 0.10x.
 PRICING = {
+    "claude-opus-5-5": {"in": 4.00, "out": 20.00},
+    # Haiku 5.5 bills $0.50/$2.50 past 100K input tokens; Dave's prompts stay
+    # far below that (capped history, 2000-char input, small images).
+    "claude-haiku-5-5": {"in": 0.10, "out": 0.50},
     "claude-opus-5": {"in": 5.00, "out": 25.00},
     "claude-sonnet-5": {"in": 3.00, "out": 15.00},
     "claude-haiku-4-5": {"in": 1.00, "out": 5.00},

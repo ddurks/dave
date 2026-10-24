@@ -305,9 +305,13 @@ def _split_system(messages: list):
     return system, rest
 
 
-# Only the Opus/Sonnet 5 generation accepts output_config.effort; Haiku 4.5
-# rejects it with a 400.
-_EFFORT_MODELS = {"claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7"}
+# Models that accept output_config.effort; Haiku 4.5 rejects it with a 400.
+# Opus 5.5 and Haiku 5.5 always think and default to medium effort, so they
+# need both the explicit "low" and the thinking-sized max_tokens.
+_EFFORT_MODELS = {
+    "claude-opus-5-5", "claude-haiku-5-5",
+    "claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7",
+}
 
 # Models that think leave less of max_tokens for the answer, and thinking counts
 # against it -- too tight a ceiling truncates the JSON mid-object. max_tokens is

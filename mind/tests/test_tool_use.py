@@ -157,3 +157,16 @@ def test_effort_is_only_sent_to_models_that_accept_it():
         [{"role": "user", "content": "hi"}], tools.respond_tool,
     )
     assert good.messages.create.call_args.kwargs["output_config"]["effort"] == "low"
+
+
+def test_current_models_get_low_effort_and_thinking_headroom():
+    """Opus 5.5 and Haiku 5.5 always think and default to medium effort."""
+    for model in ("claude-opus-5-5", "claude-haiku-5-5"):
+        client = _client({"text": "x", "emotion": "boredom"})
+        tools.call_with_schema(
+            client, model, [{"role": "user", "content": "hi"}], tools.respond_tool,
+        )
+        kwargs = client.messages.create.call_args.kwargs
+        assert kwargs["output_config"]["effort"] == "low"
+        assert kwargs["max_tokens"] == tools._MAX_TOKENS["thinking"]
+

@@ -21,8 +21,8 @@ from unittest.mock import MagicMock
 # ── Environment setup (must happen before app import) ─────────────────────────
 
 os.environ.setdefault("ANTHROPIC_API_KEY", "test")
-os.environ.setdefault("DAVE_MODEL_RESPOND", "claude-opus-5")
-os.environ.setdefault("DAVE_MODEL_BACKGROUND", "claude-haiku-4-5")
+os.environ.setdefault("DAVE_MODEL_RESPOND", "claude-opus-5-5")
+os.environ.setdefault("DAVE_MODEL_BACKGROUND", "claude-haiku-5-5")
 
 # ── Stub data files if missing (must happen before app import) ────────────────
 

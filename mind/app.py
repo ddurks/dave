@@ -63,8 +63,8 @@ logger = logging.getLogger(__name__)
 # Conversation gets the good model because a human is waiting on it. Everything
 # Dave does on his own runs on the cheap one. Claude is natively multimodal, so
 # vision needs no separate model.
-MODEL_RESPOND = os.environ.get('DAVE_MODEL_RESPOND', 'claude-opus-5')
-MODEL_BACKGROUND = os.environ.get('DAVE_MODEL_BACKGROUND', 'claude-haiku-4-5')
+MODEL_RESPOND = os.environ.get('DAVE_MODEL_RESPOND', 'claude-opus-5-5')
+MODEL_BACKGROUND = os.environ.get('DAVE_MODEL_BACKGROUND', 'claude-haiku-5-5')
 MODEL_VISION = os.environ.get('DAVE_MODEL_VISION', MODEL_BACKGROUND)
 PEXELS_API_KEY = os.environ.get('PEXELS_API_KEY')
 # CORS proxy base URL (e.g. a Cloudflare Worker) used to re-serve Internet

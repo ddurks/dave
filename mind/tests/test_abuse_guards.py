@@ -90,3 +90,18 @@ def test_store_refuses_local_fallback_on_lambda(monkeypatch):
     monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "dave-mind-dev-query")
     with pytest.raises(RuntimeError):
         state.get_store()
+
+
+def test_unpriced_model_is_refused():
+    """A model missing from PRICING would meter as $0 and dodge the cap."""
+    ok, why = budget.allows("claude-unpriced-9")
+    assert not ok
+    assert "no price" in why
+
+
+def test_configured_models_are_priced():
+    import state_config
+    assert app.MODEL_RESPOND in state_config.PRICING
+    assert app.MODEL_BACKGROUND in state_config.PRICING
+    assert app.MODEL_VISION in state_config.PRICING
+
