@@ -57,12 +57,18 @@ def lane_status(lane: str):
     total_cap = config.MONTHLY_BUDGET_USD * 1_000_000
     if total_cap <= 0:
         return False, "budget is zero"
-    spent = state.budget_spent_micros()
+    try:
+        spent = state.budget_spent_micros()
+        lane_spent = state.budget_lane_micros(lane)
+    except Exception as e:
+        # No ledger, no spending: an unreadable budget must not read as zero.
+        logger.error("budget ledger unavailable: %s", e)
+        return False, "budget ledger unavailable"
     if spent >= total_cap:
         return False, "monthly budget spent"
     if lane == "background" and spent >= total_cap * config.BACKGROUND_CUTOFF:
         return False, "background paused so conversation survives the month"
-    if state.budget_lane_micros(lane) >= total_cap * config.BUDGET_SPLIT.get(lane, 1.0):
+    if lane_spent >= total_cap * config.BUDGET_SPLIT.get(lane, 1.0):
         return False, "this lane has spent its share"
     return True, ""
 

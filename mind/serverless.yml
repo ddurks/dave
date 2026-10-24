@@ -8,6 +8,21 @@ provider:
   region: us-east-1
   memorySize: 512
   timeout: 30
+  # The query Lambda's state (budget ledger, rate limits, mood, memory) lives
+  # in this one table. Without access, the budget cap can't be enforced, so
+  # state.py refuses to fall back to a local file on Lambda.
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:DescribeTable
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+            - dynamodb:Query
+          Resource: arn:aws:dynamodb:us-east-1:593615615124:table/dave-mind
 
 custom:
   customDomain:
@@ -32,6 +47,9 @@ custom:
 functions:
   query:
     handler: app.lambda_handler
+    # At most this many requests run (and spend) at once; the rest get 429s
+    # from Lambda. Bounds how fast an attacker can burn the monthly budget.
+    reservedConcurrency: 5
     # Scoped to this function rather than `provider` so the publicly-invokable
     # videoproxy Function URL doesn't inherit the API keys.
     environment:

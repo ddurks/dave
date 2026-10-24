@@ -26,6 +26,7 @@ import mood
 import state
 import state_config
 import budget
+import ratelimit
 import sessions as session_store
 import turnlog
 from flask import Flask, request, jsonify, send_from_directory
@@ -440,6 +441,10 @@ def _generate_search_query(llm_client, model: str, hour: int) -> Optional[str]:
         period = "evening"
     else:
         period = "late night"
+    ok, why = budget.allows(model)
+    if not ok:
+        logger.info("skipping search query generation: %s", why)
+        return None
     try:
         resp = llm_client.messages.create(
             model=model,
@@ -452,6 +457,7 @@ def _generate_search_query(llm_client, model: str, hour: int) -> Optional[str]:
             )}],
             messages=[{"role": "user", "content": f"It is {period}. What will you watch?"}],
         )
+        budget.record(model, getattr(resp, "usage", None))
         query = "".join(
             b.text for b in resp.content if getattr(b, "type", None) == "text"
         ).strip().strip('"').strip("'")
@@ -1378,6 +1384,9 @@ def query():
         body = request.get_json() or {}
         if not body.get("type"):
             return jsonify({"error": "type is required (respond|idle|browse|muse)"}), 400
+        limited = ratelimit.check(request.remote_addr or "", str(body.get("type", "")).lower())
+        if limited:
+            return jsonify({"error": limited}), 429
         result, status = dispatch(body)
         return jsonify(result), status
     except Exception as e:
@@ -1516,6 +1525,15 @@ def lambda_handler(event, context):
                 "statusCode": 400,
                 "headers": {"Content-Type": "application/json", **cors_headers},
                 "body": json.dumps({"error": "type is required (respond|idle|browse|muse)"}),
+            }
+        source_ip = (event.get("requestContext") or {}).get("identity", {}).get("sourceIp") \
+            or (event.get("requestContext") or {}).get("http", {}).get("sourceIp", "")
+        limited = ratelimit.check(source_ip, str(body.get("type", "")).lower())
+        if limited:
+            return {
+                "statusCode": 429,
+                "headers": {"Content-Type": "application/json", **cors_headers},
+                "body": json.dumps({"error": limited}),
             }
         result, status = dispatch(body)
         return {

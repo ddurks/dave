@@ -111,6 +111,21 @@ class LocalStore:
             self._write(db)
             return True
 
+    def add_hit(self, pk, sk, expires):
+        with self._lock:
+            db = self._read()
+            key = pk + "|" + sk
+            row = db.get(key) or {"pk": pk, "sk": sk, "n": 0}
+            row["n"] += 1
+            row["expires"] = expires
+            db[key] = row
+            # Drop expired windows so the dev file doesn't grow forever.
+            now = time.time()
+            for k in [k for k, r in db.items() if k.startswith("RATE|") and r.get("expires", now) < now]:
+                del db[k]
+            self._write(db)
+            return row["n"]
+
     def add_counter(self, pk, sk, field, delta):
         with self._lock:
             db = self._read()
@@ -195,6 +210,16 @@ class DynamoStore:
                 return False
             raise
 
+    def add_hit(self, pk, sk, expires):
+        r = self.table.update_item(
+            Key={"pk": pk, "sk": sk},
+            UpdateExpression="ADD #n :one SET #e = :exp",
+            ExpressionAttributeNames={"#n": "n", "#e": "expires"},
+            ExpressionAttributeValues={":one": 1, ":exp": expires},
+            ReturnValues="UPDATED_NEW",
+        )
+        return int(r["Attributes"]["n"])
+
     def add_counter(self, pk, sk, field, delta):
         r = self.table.update_item(
             Key={"pk": pk, "sk": sk},
@@ -220,6 +245,12 @@ def get_store():
         _store, _backend_name = s, "dynamodb"
         logger.info("store: DynamoDB table %s", config.TABLE_NAME)
     except Exception as e:
+        # On Lambda the local file would be read-only and per-container, so the
+        # budget ledger and rate limits would silently read zero. Refuse instead;
+        # callers treat a store error as "no".
+        if os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+            logger.error("DynamoDB unavailable on Lambda (%s); refusing to fall back", e)
+            raise
         logger.warning("DynamoDB unavailable (%s); using local file store", e)
         _store, _backend_name = LocalStore(config.LOCAL_STATE_PATH), "local"
     return _store
@@ -344,3 +375,14 @@ def budget_report():
             if isinstance(k, str) and k.startswith("lane_")
         },
     }
+
+
+# -- Rate limiting ------------------------------------------------------------
+
+def hit(bucket, window_s):
+    """Count one request against `bucket` in the current fixed window and
+    return the new total. Rows carry `expires`, so DynamoDB TTL sweeps them."""
+    now = int(time.time())
+    start = now - now % window_s
+    return get_store().add_hit("RATE", f"{bucket}#{window_s}#{start}", start + window_s * 2)
+
