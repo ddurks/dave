@@ -150,8 +150,8 @@ export class Pathfinder {
    * @param {BABYLON.Vector3} agentPos - Current agent position (y ignored)
    * @param {BABYLON.Vector3} realTarget - Desired world destination
    * @param {number} waypointThreshold - Distance at which a waypoint is considered reached
-   * @param {number} blendSpeed - Rate at which navTargetBlendFactor advances
-   * @param {number} dt - Delta time in seconds
+   * @param {number} blendSpeed - navTargetBlendFactor gained per unit of `dt`
+   * @param {number} dt - Progress since the last call (Dave passes distance walked)
    * @returns {BABYLON.Vector3} Next position to steer toward
    */
   getNextTarget(agentPos, realTarget, waypointThreshold, blendSpeed, dt) {

@@ -52,7 +52,9 @@ export const MOVEMENT = {
   WANDER_BOUNDS: 14,
   TURN_SPEED: 5.0,
   WAYPOINT_THRESHOLD: 1.2,
-  WAYPOINT_BLEND_SPEED: 0.8,
+  // Blend toward the following waypoint per unit walked (0.8/s at the old
+  // fixed 2.5 u/s), so the route doesn't depend on how fast the gait goes.
+  WAYPOINT_BLEND_PER_UNIT: 0.32,
   PATH_RECALC_DISTANCE: 5,
   PATH_RECALC_DEBOUNCE_MS: 500,
 };

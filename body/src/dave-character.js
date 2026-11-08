@@ -1076,18 +1076,23 @@ export class Dave {
   }
 
   // ── Behavior Update ──────────────────────────────────────────────────────
-  getNavigationTarget(realTarget, dt) {
+  getNavigationTarget(realTarget) {
     const agentPos = new BABYLON.Vector3(
       this.daveCapsule.position.x,
       0,
       this.daveCapsule.position.z,
     );
+    const walked = this._lastNavPos
+      ? agentPos.subtract(this._lastNavPos).length()
+      : 0;
+    this._lastNavPos = agentPos;
+    // Rate × distance instead of rate × time: the blend tracks progress.
     return this.pathfinder.getNextTarget(
       agentPos,
       realTarget,
       this.cfg.MOVEMENT.WAYPOINT_THRESHOLD,
-      this.cfg.MOVEMENT.WAYPOINT_BLEND_SPEED,
-      dt,
+      this.cfg.MOVEMENT.WAYPOINT_BLEND_PER_UNIT,
+      walked,
     );
   }
 
@@ -1391,7 +1396,7 @@ export class Dave {
    * @returns {boolean} true when arrived
    */
   _walkToward(dt, arrivalThreshold) {
-    const navTarget = this.getNavigationTarget(this.wanderTarget, dt);
+    const navTarget = this.getNavigationTarget(this.wanderTarget);
     const dir = navTarget.subtract(this.daveCapsule.position);
     dir.y = 0;
 

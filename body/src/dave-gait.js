@@ -21,15 +21,18 @@ const CROUCH_SPEED = 4;
 const DROP_DECAY = 10;
 const SETTLE_DIST = 0.04; // standing feet this far off home step back under the hips
 const SETTLE_ANGLE = 0.3; // radians
+const LEG_STRAIGHT = 0.99; // planted legs extend to this fraction of full length
 
 const DEFAULTS = {
-  gait_stride: 0.7,
+  gait_stride: 0.4,
   gait_step_height: 0.1,
-  gait_step_time: 0.22,
-  gait_hold_time: 0.2,
+  gait_step_time: 0.2,
+  gait_hold_time: 0.15,
   gait_hesitation: 0.6,
-  gait_hip_drop: 0.05,
-  gait_crouch: 0.1,
+  gait_hip_drop: 0.02,
+  gait_crouch: 0.01, // base knee softness; the hips also dip as far as the feet need
+  gait_hip_forward: 0.05, // hips ride this far ahead of the feet while walking
+  gait_head_droop: 8, // degrees the head hangs forward while walking
 };
 
 export class DaveGait {
@@ -48,6 +51,10 @@ export class DaveGait {
     this.hesitation = p.gait_hesitation;
     this.hipDrop = p.gait_hip_drop;
     this.crouchDepth = p.gait_crouch;
+    this.hipForward = p.gait_hip_forward;
+    this.headDroop = (p.gait_head_droop * Math.PI) / 180;
+    // The neck, not the head: the head belongs to the look-at system.
+    this.neck = node("neck");
 
     this.legs = SIDES.map((side) => ({
       side,
@@ -62,6 +69,11 @@ export class DaveGait {
       swing: null, // { from, fromHeading, t }
     }));
 
+    // Every bone we rotate, with the pose it had before we touched it.
+    this.driven = [this.neck, ...this.legs.flatMap((l) => [l.femur, l.tibia, l.foot])].map(
+      (bone) => ({ bone, base: null, written: null }),
+    );
+
     this.armatureBase = this.armature.position.clone();
     this.weight = 0;
     this.active = false;
@@ -71,6 +83,10 @@ export class DaveGait {
     this.hold = 0;
     this.lastLeg = this.legs[1];
     this.speed = 0;
+    // How far the body really moves per step (physics doesn't track the
+    // commanded speed exactly). Each foot is planted for one step, so it
+    // lands half of this ahead of home and lifts half of it behind.
+    this.advance = this.stride / 2;
   }
 
   /**
@@ -92,13 +108,19 @@ export class DaveGait {
     const prevWeight = this.weight;
     this.weight = clamp(this.weight + (active ? 1 : -1) * FADE_SPEED * dt, 0, 1);
     this.armature.position.copyFrom(this.armatureBase);
+    this._restoreUnanimated();
     if (this.weight === 0) {
       this.speed = 0;
       for (const leg of this.legs) leg.pos = null;
       return;
     }
     this.armature.computeWorldMatrix(true);
-    for (const leg of this.legs) this._refreshChain(leg);
+    for (const leg of this.legs) {
+      this._refreshChain(leg);
+      leg.length ??=
+        BABYLON.Vector3.Distance(leg.femur.getAbsolutePosition(), leg.tibia.getAbsolutePosition()) +
+        BABYLON.Vector3.Distance(leg.tibia.getAbsolutePosition(), leg.foot.getAbsolutePosition());
+    }
 
     const homes = this.legs.map((leg) => leg.target.getAbsolutePosition().clone());
     const fwd = this._forward(this.legs[0], homes[0]);
@@ -108,16 +130,37 @@ export class DaveGait {
 
     this.crouch += ((this.moving ? 1 : 0) - this.crouch) * Math.min(1, CROUCH_SPEED * dt);
     this.drop *= Math.exp(-DROP_DECAY * dt);
-    const lower = (this.crouch * this.crouchDepth + this.drop * this.hipDrop) * this.weight;
-    if (lower > 0) {
+    // Hips ride forward over the feet and dip only as far as the planted feet
+    // need to stay reachable with nearly straight legs, plus the footfall bob.
+    const ahead = this.crouch * this.hipForward * this.weight;
+    const lower =
+      (this.crouch * this.crouchDepth + this._reachDrop(fwd.scale(ahead)) + this.drop * this.hipDrop) *
+      this.weight;
+    if (lower > 0 || ahead > 0) {
       const parentInv = this.armature.parent.getWorldMatrix().clone().invert();
-      const down = BABYLON.Vector3.TransformNormal(UP.scale(-lower), parentInv);
-      this.armature.position.addInPlace(down);
+      const shift = UP.scale(-lower).add(fwd.scale(ahead));
+      this.armature.position.addInPlace(BABYLON.Vector3.TransformNormal(shift, parentInv));
       this.armature.computeWorldMatrix(true);
       for (const leg of this.legs) this._refreshChain(leg);
     }
 
     for (const leg of this.legs) this._solve(leg);
+
+    // Mope: let the head hang forward a little.
+    const droop = this.headDroop * this.crouch * this.weight;
+    if (droop > 0) rotateAboutWorld(this.neck, BABYLON.Vector3.Cross(UP, fwd), droop);
+    for (const d of this.driven) d.written = d.bone.rotationQuaternion?.clone() ?? null;
+  }
+
+  // A bone the current clip doesn't key still holds what we wrote last
+  // frame; put its own pose back so our rotations don't stack up.
+  _restoreUnanimated() {
+    for (const d of this.driven) {
+      const q = d.bone.rotationQuaternion;
+      if (q && d.written && q.equals(d.written)) q.copyFrom(d.base);
+      d.base = q?.clone() ?? null;
+      d.written = null;
+    }
   }
 
   // ── Step planning ──────────────────────────────────────────────────────────
@@ -135,6 +178,7 @@ export class DaveGait {
 
   _plan(dt, homes, fwd) {
     const reach = this.moving ? this.stride / 2 : 0;
+    const land = this.moving ? this.advance / 2 : 0;
     this.speed = 0;
     this.hold -= dt;
 
@@ -145,7 +189,7 @@ export class DaveGait {
       s.t = Math.min(1, s.t + dt / this.stepTime);
       // Fast lift, then a clunky settle onto the floor.
       const e = 1 - Math.pow(1 - s.t, 3);
-      const target = homes[swinging].add(fwd.scale(reach));
+      const target = homes[swinging].add(fwd.scale(land));
       leg.pos = BABYLON.Vector3.Lerp(s.from, target, e);
       leg.pos.y += Math.sin(Math.PI * s.t) * this.stepHeight;
       leg.heading = BABYLON.Vector3.Lerp(s.fromHeading, fwd, e).normalize();
@@ -154,6 +198,10 @@ export class DaveGait {
         this.speed = (reach * Math.PI * Math.sin(Math.PI * s.t)) / (2 * this.stepTime);
       }
       if (s.t >= 1) {
+        if (this.moving) {
+          const moved = BABYLON.Vector3.Dot(homes[swinging].subtract(s.home), fwd);
+          this.advance = clamp(0.5 * this.advance + 0.5 * moved, 0, reach);
+        }
         leg.pos = target;
         leg.swing = null;
         this.lastLeg = leg;
@@ -181,8 +229,23 @@ export class DaveGait {
       });
     }
     if (next) {
-      next.swing = { from: next.pos.clone(), fromHeading: next.heading.clone(), t: 0 };
+      const home = homes[this.legs.indexOf(next)].clone();
+      next.swing = { from: next.pos.clone(), fromHeading: next.heading.clone(), home, t: 0 };
     }
+  }
+
+  // How far the hips must come down for every planted foot to be in reach.
+  _reachDrop(hipShift) {
+    let drop = 0;
+    for (const leg of this.legs) {
+      if (leg.swing) continue;
+      const hip = leg.femur.getAbsolutePosition().add(hipShift);
+      const x = flat(leg.pos.subtract(hip)).length();
+      const reach = LEG_STRAIGHT * leg.length;
+      const height = hip.y - leg.pos.y;
+      drop = Math.max(drop, height - Math.sqrt(Math.max(0, reach * reach - x * x)));
+    }
+    return drop;
   }
 
   _forward(leg, home) {
@@ -234,8 +297,7 @@ function flat(v) {
 
 /**
  * Rotate `node` about its pivot so world direction `from` turns toward `to`,
- * by `weight` of the full angle. Works in the parent's frame, so it holds up
- * under the glTF root's mirroring scale.
+ * by `weight` of the full angle.
  */
 function rotateToward(node, from, to, weight) {
   const f = from.normalizeToNew();
@@ -243,7 +305,16 @@ function rotateToward(node, from, to, weight) {
   const axis = BABYLON.Vector3.Cross(f, t);
   const sin = axis.length();
   if (sin < 1e-6) return;
-  let angle = Math.atan2(sin, BABYLON.Vector3.Dot(f, t)) * weight;
+  rotateAboutWorld(node, axis, Math.atan2(sin, BABYLON.Vector3.Dot(f, t)) * weight);
+}
+
+/**
+ * Rotate `node` about its pivot by `angle` around world-space `axis`.
+ * Works in the parent's frame, so it holds up under the glTF root's
+ * mirroring scale.
+ */
+function rotateAboutWorld(node, axis, angle) {
+  node.parent.computeWorldMatrix(true);
   const parentWorld = node.parent.getWorldMatrix();
   if (parentWorld.determinant() < 0) angle = -angle;
   const localAxis = BABYLON.Vector3.TransformNormal(axis, parentWorld.clone().invert()).normalize();
