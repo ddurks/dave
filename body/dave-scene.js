@@ -1588,10 +1588,13 @@ const rectW = isMobile ? "92%" : "520px";
 const bubbleFontSize = isMobile ? 14 : 18;
 const bubbleOffsetY = isMobile ? -200 : -320;
 
+// The GUI draws to a canvas, which won't wait for a webfont the way CSS does.
+await document.fonts.load("18px AngularDaveHand");
+
 const speechBubble = new BABYLON.GUI.TextBlock("speechBubble", "");
 speechBubble.color = "#c0e8c0";
 speechBubble.fontSize = bubbleFontSize;
-speechBubble.fontFamily = "'Segoe UI', system-ui, sans-serif";
+speechBubble.fontFamily = "'AngularDaveHand', 'Segoe UI', system-ui, sans-serif";
 speechBubble.textWrapping = true;
 speechBubble.resizeToFit = false;
 speechBubble.width = bubbleW;
@@ -1607,7 +1610,7 @@ speechBubble.alpha = 0;
 const speechBubblePrev = new BABYLON.GUI.TextBlock("speechBubblePrev", "");
 speechBubblePrev.color = "#7aaa8a";
 speechBubblePrev.fontSize = Math.round(bubbleFontSize * 0.85);
-speechBubblePrev.fontFamily = "'Segoe UI', system-ui, sans-serif";
+speechBubblePrev.fontFamily = "'AngularDaveHand', 'Segoe UI', system-ui, sans-serif";
 speechBubblePrev.textWrapping = true;
 speechBubblePrev.resizeToFit = false;
 speechBubblePrev.width = bubbleW;
