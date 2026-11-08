@@ -46,7 +46,6 @@ export const MODEL = {
 
 // ── Navigation & Movement ────────────────────────────────────────────────────
 export const MOVEMENT = {
-  BASE_WALK_SPEED: 2.5,
   // Furniture cluster extends to ~12.7 (floorlamp at (-8.83, 9.14)).
   // Walls sit at ±20. 14 lets Dave roam ~1-2 units past the outermost
   // furniture while staying well inside the inner half of the floor.

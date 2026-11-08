@@ -11,6 +11,7 @@ import { normalizeAngle, clamp } from "./utils.js";
 import { Pathfinder, NavGrid } from "./dave-pathfinder.js";
 import Beer from "./dave-beer.js";
 import AnimationController from "./dave-animation-controller.js";
+import DaveGait from "./dave-gait.js";
 import ExpressionManager from "./dave-expression-manager.js";
 import Scheduler from "./dave-scheduler.js";
 
@@ -146,7 +147,6 @@ export class Dave {
     this.nextInteractionDuration = Infinity;
     this.nextStateAfterGetUp = null; // State to transition to after reverse animation (e.g. "talking")
     this.interactionDuration = 0;
-    this.walkSpeed = cfg.MOVEMENT.BASE_WALK_SPEED;
     this.gettingUpAnim = null; // Animation being reversed for getting up
     this.gettingUpTimer = 0; // Time to wait for reverse animation to finish
     this.currentAction = null; // Active ACTION_DEFS key (null = locomotion only)
@@ -197,6 +197,9 @@ export class Dave {
 
     // Start with idle
     this.animationController.playForward("idle", true);
+
+    // Procedural legs while standing and walking; see dave-gait.js
+    this.gait = new DaveGait(imported);
 
     // ── Expression Control System ────────────────────────────────────────────
     this.bodyMorphs = this.getMorphMap(this.findMesh("body"));
@@ -689,8 +692,6 @@ export class Dave {
       return;
     }
 
-    this.walkSpeed =
-      this.cfg.MOVEMENT.BASE_WALK_SPEED * (0.85 + Math.random() * 0.3);
     this.wanderTarget = new BABYLON.Vector3(
       (Math.random() - 0.5) * 2 * this.WANDER_BOUNDS,
       0,
@@ -1403,7 +1404,7 @@ export class Dave {
       return true;
     }
 
-    const moveDir = dir.normalize().scale(this.walkSpeed);
+    const moveDir = dir.normalize().scale(this.gait.bodySpeed());
     this.rotateToward(this.getForwardAngle(navTarget), dt);
     const currentVel = this.davePhysics.body.getLinearVelocity();
     this.davePhysics.body.setLinearVelocity(
@@ -1525,8 +1526,10 @@ export class Dave {
     if (this.state === S.TURNING) {
       if (this.rotateToward(this.getForwardAngle(this.wanderTarget), dt)) {
         this._setState(S.WALKING);
-        const animSpeed = 3.0 + Math.random() * 2.0;
-        this.animationController.playForward("shuffle", true, animSpeed);
+        // The gait drives the legs; keep idle going for the upper body.
+        if (this.animationController.currentAnimName !== "idle") {
+          this.animationController.playForward("idle", true);
+        }
       }
       return;
     }
@@ -1541,8 +1544,10 @@ export class Dave {
     if (this.state === S.TURNING_TO_APPROACH) {
       if (this.rotateToward(this.getForwardAngle(this.wanderTarget), dt)) {
         this._setState(S.WALKING_TO_APPROACH);
-        const animSpeed = 3.0 + Math.random() * 2.0;
-        this.animationController.playForward("shuffle", true, animSpeed);
+        // The gait drives the legs; keep idle going for the upper body.
+        if (this.animationController.currentAnimName !== "idle") {
+          this.animationController.playForward("idle", true);
+        }
       }
       return;
     }
@@ -2086,6 +2091,11 @@ export class Dave {
     // Movement FSM
     this.updateBehavior(dt);
     this.updateTurnToCamera(dt);
+    this.gait.update(
+      dt,
+      this.state !== S.INTERACTING && this.state !== S.GETTING_UP,
+      this.state === S.WALKING || this.state === S.WALKING_TO_APPROACH,
+    );
 
     // Gaze and head tracking
     this.updateEyeLookAt(dt);
