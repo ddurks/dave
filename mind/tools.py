@@ -207,6 +207,25 @@ distill_tool = {
     },
 }
 
+tweet_tool = {
+    "type": "function",
+    "function": {
+        "name": "tweet",
+        "description": "D.A.V.E.'s one public post for the day.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "The post itself, under 240 characters.",
+                },
+                "emotion": {"type": "string", "enum": EMOTION_ENUM},
+            },
+            "required": ["text", "emotion"],
+        },
+    },
+}
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
