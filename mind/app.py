@@ -11,7 +11,7 @@ import logging
 import random
 import time
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, Any, Optional
 from html.parser import HTMLParser
 from urllib.parse import quote
@@ -40,7 +40,6 @@ from tools import (
     browse_choose_tool,
     distill_tool,
     muse_tool,
-    tweet_tool,
 )
 
 # ── Setup ────────────────────────────────────────────────────────────────────
@@ -140,7 +139,6 @@ def load_prompts():
         'browse_pick_prompt': behavior_data['browsePickPrompt'],
         'browse_react_prompt': behavior_data['browseReactPrompt'],
         'distill_prompt': behavior_data.get('distillPrompt', ''),
-        'tweet_prompt': behavior_data.get('tweetPrompt', ''),
     }
 
 PROMPTS = load_prompts()
@@ -152,7 +150,6 @@ IDLE_PROMPT = PROMPTS['idle_prompt']
 BROWSE_PICK_PROMPT = PROMPTS['browse_pick_prompt']
 BROWSE_REACT_PROMPT = PROMPTS['browse_react_prompt']
 DISTILL_PROMPT = PROMPTS['distill_prompt']
-TWEET_PROMPT = PROMPTS['tweet_prompt']
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1479,77 +1476,6 @@ def api_mind():
 def health():
     """Health check"""
     return jsonify({"status": "ok", "model": MODEL_BACKGROUND}), 200
-
-# ── Daily Post ───────────────────────────────────────────────────────────────
-
-# Dave posts through the X account and app that postinparadise already uses;
-# its OAuth 1.0a user tokens live in that project's Secrets Manager secret.
-TWITTER_SECRET_ID = os.environ.get('TWITTER_SECRET_ID', 'postinparadise/secrets')
-TWITTER_SECRET_REGION = os.environ.get('TWITTER_SECRET_REGION', 'us-east-2')
-TWEET_MAX_CHARS = 280
-
-
-def _write_tweet() -> Dict[str, Any]:
-    """Ask him for today's post, written from the last day of his memory."""
-    cutoff = time.time() - 24 * 3600
-    rows = [r for r in memory.recent(limit=60) if r.get("ts", 0) >= cutoff]
-    day = '\n'.join("- %s: %s" % (r.get("kind"), r["text"][:200]) for r in reversed(rows))
-    posts = state.get_store().query("TWEET", limit=5, reverse=True)
-    past = '\n'.join("- " + r["text"] for r in posts) or "(none yet)"
-    return call_with_schema(
-        get_client(),
-        MODEL_BACKGROUND,
-        [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            live_block(),
-            {"role": "user", "content": "%s\n\nYour recent posts:\n%s\n\nYour last day:\n%s" % (TWEET_PROMPT, past, day or "(nothing happened)")},
-        ],
-        tweet_tool,
-    )
-
-
-def _post_tweet(text: str) -> str:
-    """Post to X and return the new tweet's id."""
-    import boto3
-    from requests_oauthlib import OAuth1
-
-    secret = boto3.client('secretsmanager', region_name=TWITTER_SECRET_REGION)
-    creds = json.loads(secret.get_secret_value(SecretId=TWITTER_SECRET_ID)['SecretString'])
-    res = http_requests.post(
-        "https://api.x.com/2/tweets",
-        json={"text": text},
-        auth=OAuth1(creds['appKey'], creds['appSecret'], creds['accessToken'], creds['accessSecret']),
-        timeout=15,
-    )
-    res.raise_for_status()
-    return res.json()["data"]["id"]
-
-
-def tweet_handler(event, context):
-    """Daily EventBridge job: one post per UTC day. {"dryRun": true} only writes it."""
-    dry_run = bool((event or {}).get("dryRun"))
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    store = state.get_store()
-    if not dry_run and store.get_item("TWEET", today):
-        return {"skipped": "already posted today"}
-
-    data = _write_tweet()
-    text = (data.get("text") or "").strip()
-    # The budget and refusal fallbacks carry a canned line flagged _rate_limited;
-    # those are for visitors, not the public timeline.
-    if not text or data.get("_rate_limited") or data.get("_raw_text"):
-        logger.warning("no tweet today: %s", data)
-        return {"skipped": "nothing written"}
-    if len(text) > TWEET_MAX_CHARS:
-        text = text[:TWEET_MAX_CHARS - 1].rstrip() + "…"
-    if dry_run:
-        return {"dryRun": True, "text": text}
-
-    tweet_id = _post_tweet(text)
-    store.put_item("TWEET", today, {"id": tweet_id, "text": text, "ts": int(time.time())})
-    memory.remember("tweet", text, emotion=resolve_emotion(data.get("emotion"), strength=0.2))
-    logger.info("tweeted %s: %s", tweet_id, text)
-    return {"id": tweet_id, "text": text}
 
 # ── Lambda Entrypoint ────────────────────────────────────────────────────────
 

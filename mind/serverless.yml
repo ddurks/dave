@@ -23,11 +23,6 @@ provider:
             - dynamodb:DeleteItem
             - dynamodb:Query
           Resource: arn:aws:dynamodb:us-east-1:593615615124:table/dave-mind
-        # The X account's tokens, shared with postinparadise (see tweet below).
-        - Effect: Allow
-          Action:
-            - secretsmanager:GetSecretValue
-          Resource: arn:aws:secretsmanager:us-east-2:593615615124:secret:postinparadise/secrets-*
 
 custom:
   customDomain:
@@ -86,22 +81,6 @@ functions:
           path: health
           method: get
           cors: true
-
-  # Dave's one post a day on X, written from the last day of his memory.
-  # Dry-run without posting: sls invoke -f tweet -d '{"dryRun": true}'
-  tweet:
-    handler: app.tweet_handler
-    timeout: 60
-    environment:
-      ANTHROPIC_API_KEY: ${ssm:/dave/anthropic-api-key}
-      DAVE_MODEL_RESPOND: claude-opus-5-5
-      DAVE_MODEL_BACKGROUND: claude-haiku-5-5
-    package:
-      patterns:
-        - "!videoproxy.js"
-    events:
-      # 19:00 UTC: early afternoon across the US.
-      - schedule: cron(0 19 * * ? *)
 
   # CORS streaming proxy for Internet Archive videos. A Lambda Function URL in
   # RESPONSE_STREAM mode — API Gateway can't stream and caps payloads at ~10 MB,
