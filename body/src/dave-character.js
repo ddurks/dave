@@ -175,7 +175,6 @@ export class Dave {
 
     // ── Animation Control System ─────────────────────────────────────────────
     this.idleAnim = this.findAnim("idle");
-    this.shuffleAnim = this.findAnim("shuffle");
     this.sitAnim = this.findAnim("sit");
     this.laydownAnim = this.findAnim("laydown") || this.findAnim("lay");
     this.chugAnim = this.findAnim("chug");
@@ -183,7 +182,6 @@ export class Dave {
 
     this.ANIM_MAP = {
       idle: this.idleAnim,
-      shuffle: this.shuffleAnim,
       sit: this.sitAnim,
       laydown: this.laydownAnim,
       chug: this.chugAnim,

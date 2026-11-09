@@ -77,7 +77,7 @@ export class DaveGait {
       pole: node(`ik.pole.${side}`),
       pos: null, // planted (or swinging) ankle position, world
       heading: null, // planted foot direction, world, horizontal
-      swing: null, // { from, fromHeading, t }
+      swing: null, // { from, fromHeading, home, t }
     }));
 
     // Each arm follows the opposite leg.
@@ -102,7 +102,6 @@ export class DaveGait {
 
     this.armatureBase = this.armature.position.clone();
     this.weight = 0;
-    this.active = false;
     this.moving = false;
     this.crouch = 0;
     this.drop = 0;
@@ -129,7 +128,6 @@ export class DaveGait {
    * @param {boolean} moving - the body wants to travel forward
    */
   update(dt, active, moving) {
-    this.active = active;
     this.moving = moving && active;
     const prevWeight = this.weight;
     this.weight = clamp(this.weight + (active ? 1 : -1) * FADE_SPEED * dt, 0, 1);
