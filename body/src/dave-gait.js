@@ -10,6 +10,7 @@
  * direction. Tuning comes from the gait_* extras on the Armature node.
  * Runs after animations, overriding femur/tibia/foot on top of whatever
  * clip is playing, and fades in/out so seated and lying clips are untouched.
+ * Arms swing opposite the feet on loose springs, so they dangle and lag.
  */
 
 import { clamp } from "./utils.js";
@@ -22,6 +23,12 @@ const DROP_DECAY = 10;
 const SETTLE_DIST = 0.04; // standing feet this far off home step back under the hips
 const SETTLE_ANGLE = 0.3; // radians
 const LEG_STRAIGHT = 0.99; // planted legs extend to this fraction of full length
+// Arm springs: soft and under-damped so the arms trail, overshoot and dangle.
+const ARM_STIFFNESS = 120;
+const ARM_DAMPING = 12;
+const ELBOW_STIFFNESS = 60;
+const ELBOW_DAMPING = 8;
+const MAX_SPRING_STEP = 1 / 120; // seconds per integration substep
 
 const DEFAULTS = {
   gait_stride: 0.4,
@@ -33,6 +40,8 @@ const DEFAULTS = {
   gait_crouch: 0.01, // base knee softness; the hips also dip as far as the feet need
   gait_hip_forward: 0.05, // hips ride this far ahead of the feet while walking
   gait_head_droop: 8, // degrees the head hangs forward while walking
+  gait_arm_swing: 18, // degrees each arm swings either side of hanging
+  gait_elbow_swing: 15, // extra degrees the elbow bends on the forward swing
 };
 
 export class DaveGait {
@@ -55,6 +64,8 @@ export class DaveGait {
     this.headDroop = (p.gait_head_droop * Math.PI) / 180;
     // The neck, not the head: the head belongs to the look-at system.
     this.neck = node("neck");
+    this.armSwing = (p.gait_arm_swing * Math.PI) / 180;
+    this.elbowSwing = (p.gait_elbow_swing * Math.PI) / 180;
 
     this.legs = SIDES.map((side) => ({
       side,
@@ -69,8 +80,23 @@ export class DaveGait {
       swing: null, // { from, fromHeading, t }
     }));
 
+    // Each arm follows the opposite leg.
+    this.arms = SIDES.map((side, i) => ({
+      humerus: node(`humerus.${side}`),
+      radius: node(`radius.${side}`),
+      leg: this.legs[1 - i],
+      swing: 0, // radians forward of hanging
+      swingVel: 0,
+      bend: 0, // extra elbow bend, radians
+      bendVel: 0,
+    }));
+
     // Every bone we rotate, with the pose it had before we touched it.
-    this.driven = [this.neck, ...this.legs.flatMap((l) => [l.femur, l.tibia, l.foot])].map(
+    this.driven = [
+      this.neck,
+      ...this.legs.flatMap((l) => [l.femur, l.tibia, l.foot]),
+      ...this.arms.flatMap((a) => [a.humerus, a.radius]),
+    ].map(
       (bone) => ({ bone, base: null, written: null }),
     );
 
@@ -112,6 +138,7 @@ export class DaveGait {
     if (this.weight === 0) {
       this.speed = 0;
       for (const leg of this.legs) leg.pos = null;
+      for (const arm of this.arms) arm.swing = arm.swingVel = arm.bend = arm.bendVel = 0;
       return;
     }
     this.armature.computeWorldMatrix(true);
@@ -145,6 +172,7 @@ export class DaveGait {
     }
 
     for (const leg of this.legs) this._solve(leg);
+    this._swingArms(dt, homes, fwd);
 
     // Mope: let the head hang forward a little.
     const droop = this.headDroop * this.crouch * this.weight;
@@ -251,6 +279,32 @@ export class DaveGait {
   _forward(leg, home) {
     const f = flat(leg.pole.getAbsolutePosition().subtract(home));
     return f.normalize();
+  }
+
+  // ── Arms ───────────────────────────────────────────────────────────────────
+
+  _swingArms(dt, homes, fwd) {
+    // Down-hanging arms swing forward about this axis.
+    const axis = BABYLON.Vector3.Cross(UP.scale(-1), fwd);
+    const half = Math.max(this.advance / 2, 1e-3);
+    for (const arm of this.arms) {
+      // Where the opposite foot is in its stride: -1 behind, +1 ahead.
+      const i = this.legs.indexOf(arm.leg);
+      const phase = clamp(BABYLON.Vector3.Dot(arm.leg.pos.subtract(homes[i]), fwd) / half, -1, 1);
+      const target = phase * this.armSwing * this.crouch;
+      for (let left = dt; left > 0; left -= MAX_SPRING_STEP) {
+        const h = Math.min(left, MAX_SPRING_STEP);
+        arm.swingVel += (ARM_STIFFNESS * (target - arm.swing) - ARM_DAMPING * arm.swingVel) * h;
+        arm.swing += arm.swingVel * h;
+        // Elbow bends only forward, more as the arm comes forward.
+        const bendTarget = (Math.max(0, arm.swing) / Math.max(this.armSwing, 1e-3)) * this.elbowSwing;
+        arm.bendVel += (ELBOW_STIFFNESS * (bendTarget - arm.bend) - ELBOW_DAMPING * arm.bendVel) * h;
+        arm.bend = Math.max(0, arm.bend + arm.bendVel * h);
+      }
+      rotateAboutWorld(arm.humerus, axis, arm.swing * this.weight);
+      arm.radius.computeWorldMatrix(true);
+      rotateAboutWorld(arm.radius, axis, arm.bend * this.weight);
+    }
   }
 
   // ── Two-bone IK ────────────────────────────────────────────────────────────
