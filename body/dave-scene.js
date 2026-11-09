@@ -867,6 +867,26 @@ function _drawContain(ctx, src, srcW, srcH) {
   ctx.drawImage(src, drawX, drawY, drawW, drawH);
 }
 
+// TV static, regenerated at low resolution and scaled up into the screen.
+const TV_STATIC_SIZE = 128;
+const tvStaticCanvas = document.createElement("canvas");
+tvStaticCanvas.width = tvStaticCanvas.height = TV_STATIC_SIZE;
+const tvStaticCtx = tvStaticCanvas.getContext("2d");
+const tvStaticImage = tvStaticCtx.createImageData(TV_STATIC_SIZE, TV_STATIC_SIZE);
+
+function _drawStatic(ctx) {
+  const px = tvStaticImage.data;
+  for (let i = 0; i < px.length; i += 4) {
+    const v = Math.random() * 255;
+    px[i] = px[i + 1] = px[i + 2] = v;
+    px[i + 3] = 255;
+  }
+  tvStaticCtx.putImageData(tvStaticImage, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(tvStaticCanvas, 0, 0, TV_TEX_SIZE, TV_TEX_SIZE);
+  ctx.imageSmoothingEnabled = true;
+}
+
 function applyVideoToTv(videoUrl) {
   if (!tvMesh) return;
   clearTvVideo();
@@ -895,8 +915,10 @@ function applyVideoToTv(videoUrl) {
         video.videoWidth || TV_TEX_SIZE,
         video.videoHeight || TV_TEX_SIZE,
       );
-      dynTex.update();
+    } else {
+      _drawStatic(ctx); // until the first frame decodes
     }
+    dynTex.update();
   });
 
   video.play().catch(() => {});
