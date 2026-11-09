@@ -177,3 +177,18 @@ def test_muse_returns_valid_response(stub_llm):
     assert "emotion" in r
     assert r["text"] == "Existence is tedious."
     assert r["emotion"] == "resignation"
+
+
+def test_muse_shows_what_he_said_last_time_here(stub_llm):
+    stub_llm.set_json({"text": "The mattress accepted my weight without comment.", "emotion": "resignation"})
+    app.handle_muse({"context": "You just lay down on the bed."})
+    app.handle_muse({"context": "You just sat down at the computer."})
+
+    stub_llm.set_json({"text": "Something new.", "emotion": "boredom"})
+    app.handle_muse({"context": "You just lay down on the bed."})
+
+    bed = _user_content(stub_llm.calls[2]["messages"])
+    computer = _user_content(stub_llm.calls[1]["messages"])
+    assert "The mattress accepted my weight" in str(bed)
+    assert "do not reuse" in str(bed)
+    assert "The mattress accepted my weight" not in str(computer)

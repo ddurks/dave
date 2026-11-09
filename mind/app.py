@@ -195,10 +195,27 @@ def _topic_of(text: str) -> str:
     return words[0] if words else ""
 
 
-def _remember_musing(data: dict) -> str:
+def _remember_musing(data: dict, situation: str = "") -> str:
     emotion = resolve_emotion(data.get("emotion"), strength=0.25)
-    memory.remember("musing", (data.get("text") or "")[:500], emotion=emotion)
+    meta = {"situation": situation} if situation else None
+    memory.remember("musing", (data.get("text") or "")[:500], emotion=emotion, meta=meta)
     return emotion
+
+
+def _said_before(situation: str, limit: int = 6) -> str:
+    """What he already said the last times he was in this exact situation.
+
+    The scene sends the same few premises over and over ("You just lay down on
+    the bed."), and the same premise draws the same idea out of the model every
+    time. Showing him his own earlier lines is what makes him move on.
+    """
+    rows = [r for r in memory.recent(limit=state_config.EPISODIC_KEEP)
+            if (r.get("meta") or {}).get("situation") == situation][:limit]
+    if not rows:
+        return ""
+    lines = '\n'.join("- " + r["text"] for r in rows)
+    return ("\n\nYou have been here before. Things you already said in this exact situation; "
+            "do not reuse their ideas, images or wording:\n" + lines)
 
 
 def _remember_reaction(react: dict, subject: str = "", kind: str = "reading",
@@ -1028,11 +1045,8 @@ def handle_browse_choose(body: Dict[str, Any]) -> Dict[str, Any]:
 def handle_muse(body: Dict[str, Any]) -> Dict[str, Any]:
     """Generate a musing from a random prompt, or from a context override if provided"""
     context_override = (body.get("context") or "").strip()
-    if context_override:
-        musing_context = f"{MUSE_PREAMBLE}\n\n{context_override}"
-    else:
-        prompt = random.choice(MUSE_PROMPTS)
-        musing_context = f"{MUSE_PREAMBLE}\n\n{prompt}"
+    situation = context_override or random.choice(MUSE_PROMPTS)
+    musing_context = f"{MUSE_PREAMBLE}\n\n{situation}{_said_before(situation)}"
     try:
         data = call_with_schema(
             get_client(),
@@ -1052,7 +1066,7 @@ def handle_muse(body: Dict[str, Any]) -> Dict[str, Any]:
             text = data.get("text", "")
             response = {
                 "text": text,
-                "emotion": _remember_musing(data),
+                "emotion": _remember_musing(data, situation),
                 "gesture": None,
                 "posture": None,
                 "gaze": None,
