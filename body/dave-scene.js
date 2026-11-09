@@ -46,7 +46,13 @@ const PIP_CAMERA_NEAR_PLANE = cfg.PIP_CAMERA.NEAR_PLANE;
 const PIP_CAMERA_FOV = cfg.PIP_CAMERA.FOV;
 
 // Mute State
-let isMuted = localStorage.getItem(cfg.USER.MUTED_STORAGE_KEY) === "true";
+// iOS only lets speech start from a user gesture, so Dave starts muted there
+// and the unmute tap unlocks it (iPadOS reports itself as a Mac).
+const isIOS =
+  /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  (/Mac/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+let isMuted =
+  isIOS || localStorage.getItem(cfg.USER.MUTED_STORAGE_KEY) === "true";
 
 // ── Engine + Scene ───────────────────────────────────────────────────────
 
@@ -1503,7 +1509,8 @@ pipBox.addEventListener("click", () => {
 // reveal), whose bubble fills in word by word as Dave says each one.
 function speak(text, rate, msg = null) {
   return new Promise((resolve) => {
-    if (isMuted || !("speechSynthesis" in window)) {
+    // Timed reveal without audio, for muted Dave or when speech never starts.
+    const revealOnTimer = () => {
       dave.expressionManager.startLipSync(text);
       const durationMs = (text.length * 60) / rate;
       const msPerChar = durationMs / Math.max(text.length, 1);
@@ -1518,6 +1525,9 @@ function speak(text, rate, msg = null) {
         finishReveal(msg);
         resolve();
       }, durationMs);
+    };
+    if (isMuted || !("speechSynthesis" in window)) {
+      revealOnTimer();
       return;
     }
 
@@ -1544,7 +1554,17 @@ function speak(text, rate, msg = null) {
       clearInterval(paceTimer);
       paceTimer = null;
     };
+    // iOS Safari silently drops speech it doesn't consider user-initiated:
+    // no onstart, onend or onerror ever fires. Fall back to the timed reveal.
+    let abandoned = false;
+    const startWatchdog = setTimeout(() => {
+      abandoned = true;
+      speechSynthesis.cancel();
+      revealOnTimer();
+    }, 2500);
     utt.onstart = () => {
+      clearTimeout(startWatchdog);
+      if (abandoned) return;
       dave.expressionManager.startLipSync(text);
       if (!msg) return;
       const started = performance.now();
@@ -1555,18 +1575,23 @@ function speak(text, rate, msg = null) {
       }, 50);
     };
     utt.onboundary = (e) => {
+      if (abandoned) return;
       dave.expressionManager.speechCharIndex = e.charIndex;
       if (e.name && e.name !== "word") return;
       stopPacing();
       revealWordAt(msg, e.charIndex);
     };
     utt.onend = () => {
+      clearTimeout(startWatchdog);
+      if (abandoned) return;
       stopPacing();
       dave.expressionManager.stopLipSync();
       finishReveal(msg);
       resolve();
     };
     utt.onerror = (err) => {
+      clearTimeout(startWatchdog);
+      if (abandoned) return;
       stopPacing();
       handleError("speak", err);
       dave.expressionManager.stopLipSync();
@@ -2259,6 +2284,9 @@ updateMuteButton();
 
 muteBtn.addEventListener("click", () => {
   isMuted = !isMuted;
+  if (!isMuted && "speechSynthesis" in window) {
+    speechSynthesis.speak(new SpeechSynthesisUtterance(""));
+  }
   localStorage.setItem("dave-muted", isMuted);
   updateMuteButton();
 });
