@@ -22,6 +22,16 @@ def test_respond_with_stubbed_groq(stub_llm):
     assert result["response"]["emotion"] == "dry-amusement"
 
 
+def test_respond_passes_through_what_he_does(stub_llm):
+    stub_llm.set_json({
+        "text": "Fine.", "emotion": "resignation",
+        "moveTo": "none", "action": "dance", "gaze": "sky",
+    })
+    result, _ = app.dispatch({"type": "respond", "sessionId": "s1", "userInput": "dance"})
+    r = result["response"]
+    assert (r["moveTo"], r["action"], r["gaze"]) == (None, "dance", "sky")
+
+
 def test_two_sessions_isolated(stub_llm):
     stub_llm.set_json({"text": "reply", "emotion": "boredom"})
 
@@ -59,3 +69,19 @@ def test_respond_rejects_empty_input(stub_llm):
     result, status = app.dispatch(body)
     assert status == 400
     assert "error" in result
+
+
+def test_respond_passes_through_what_to_look_up(stub_llm):
+    stub_llm.set_json({"text": "Fine.", "emotion": "boredom", "lookUp": "Black hole"})
+    result, _ = app.dispatch({"type": "respond", "sessionId": "s1", "userInput": "look up black holes"})
+    assert result["response"]["lookUp"] == "Black hole"
+
+
+def test_browse_searches_for_a_loose_topic(stub_llm, monkeypatch):
+    pages = {"Black hole": {"type": "standard", "title": "Black hole", "extract": "A region of spacetime."}}
+    monkeypatch.setattr(app, "_fetch_wiki_summary_by_title", lambda t: pages.get(t))
+    monkeypatch.setattr(app, "_search_wiki_title", lambda q: "Black hole" if "black" in q else None)
+    monkeypatch.setattr(app, "_fetch_wiki_outbound_links", lambda t, limit=15: [])
+    stub_llm.set_json({"text": "Gravity, again.", "emotion": "existential-dread", "reason": "x", "topic": "black holes"})
+    result, _ = app.dispatch({"type": "browse", "sessionId": "s1", "title": "black holes"})
+    assert result["pageTitle"] == "wikipedia: Black hole"

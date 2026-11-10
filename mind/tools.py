@@ -48,7 +48,9 @@ EMOTION_ENUM = [
     "melancholy",
 ]
 
-MOVE_TO_ENUM = ["chair", "computer", "couch", "bed", "keg", "kegerator", "beer"]
+MOVE_TO_ENUM = ["chair", "computer", "couch", "tv", "bed", "keg", "kegerator", "beer"]
+
+ACTION_ENUM = ["dance", "wander"]
 
 IDLE_ACTION_ENUM = ["wander", "idle", "sit", "laydown", "look-around"]
 
@@ -72,12 +74,29 @@ respond_tool = {
                 "emotion": {
                     "type": "string",
                     "enum": EMOTION_ENUM,
-                    "description": "Primary emotion driving the reply.",
+                    "description": "Primary emotion driving the reply. It is also the face you make, so when asked to make a face, pick the closest one.",
                 },
                 "gesture": {"type": ["string", "null"]},
                 "posture": {"type": ["string", "null"]},
-                "gaze": {"type": ["string", "null"]},
-                "moveTo": {"type": ["string", "null"], "enum": MOVE_TO_ENUM + [None]},
+                "gaze": {
+                    "type": ["string", "null"],
+                    "enum": GAZE_TARGET_ENUM + [None],
+                    "description": "Where to look once you've finished speaking: the visitor (user), the computer screen, the floor, up at the sky, or away. Null to look wherever.",
+                },
+                "moveTo": {
+                    "type": ["string", "null"],
+                    "enum": MOVE_TO_ENUM + [None],
+                    "description": "Go somewhere after speaking. couch or tv: sit and watch TV. chair or computer: sit and browse the web. bed: lie down. keg, kegerator or beer: pour and drink a beer. Null to stay put.",
+                },
+                "lookUp": {
+                    "type": ["string", "null"],
+                    "description": "When asked to look something up or read about it: a Wikipedia article title for a topic, or the full https:// URL of a website. You go to the computer and read it. Null otherwise.",
+                },
+                "action": {
+                    "type": ["string", "null"],
+                    "enum": ACTION_ENUM + [None],
+                    "description": "Something to do after speaking instead of going somewhere: dance, or wander around the room. Null for neither.",
+                },
             },
             "required": ["text", "emotion"],
         },
@@ -144,6 +163,25 @@ muse_tool = {
                 "text": {
                     "type": "string",
                     "description": "Exactly 1 sentence of internal thought.",
+                },
+                "emotion": {"type": "string", "enum": EMOTION_ENUM},
+            },
+            "required": ["text", "emotion"],
+        },
+    },
+}
+
+say_tool = {
+    "type": "function",
+    "function": {
+        "name": "say",
+        "description": "Something D.A.V.E. says aloud to the visitor watching him.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "What he says, 1-2 sentences.",
                 },
                 "emotion": {"type": "string", "enum": EMOTION_ENUM},
             },

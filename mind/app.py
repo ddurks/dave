@@ -29,6 +29,7 @@ import budget
 import ratelimit
 import sessions as session_store
 import turnlog
+import visitors
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
@@ -40,6 +41,7 @@ from tools import (
     browse_choose_tool,
     distill_tool,
     muse_tool,
+    say_tool,
 )
 
 # ── Setup ────────────────────────────────────────────────────────────────────
@@ -184,6 +186,31 @@ def live_block() -> dict:
     return {"role": "system", "content": live_context()}
 
 
+# How many beers he's had lately, as the page counts them (it decays there).
+BUZZ_LINES = {
+    1: "You've just had a beer. A slight warmth.",
+    2: "You've had a few beers and you're tipsy: looser, more sentimental, a little sloppy with your words.",
+    3: "You're drunk: fond, rambling, overly honest, losing the thread now and then. Still yourself.",
+}
+
+
+def situation_blocks(body: Dict[str, Any], visitor: bool = False) -> list:
+    """Per-request context after live_block: the buzz, and for things said
+    to the visitor, who they are and today's gossip."""
+    try:
+        buzz = min(int(body.get("buzz") or 0), 3)
+    except (TypeError, ValueError):
+        buzz = 0
+    parts = [BUZZ_LINES[buzz]] if buzz > 0 else []
+    if visitor:
+        try:
+            parts += [visitors.visitor_context(body.get("userId")), visitors.gossip_context()]
+        except Exception as e:
+            logger.warning("visitor context unavailable: %s", e)
+    parts = [p for p in parts if p]
+    return [{"role": "system", "content": "\n\n".join(parts)}] if parts else []
+
+
 def _topic_of(text: str) -> str:
     """A crude topic key for the preoccupation weights: the longest few words.
 
@@ -324,7 +351,8 @@ def handle_respond(body: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         session_id = body.get("sessionId", "default")
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}, live_block()]
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}, live_block(),
+                    *situation_blocks(body, visitor=True)]
         messages.extend(sessions.get_turns(session_id))
         messages.append({"role": "user", "content": user_input})
 
@@ -343,6 +371,11 @@ def handle_respond(body: Dict[str, Any]) -> Dict[str, Any]:
         memory.bump_interest(_topic_of(user_input), 1.0)
         sessions.append_turn(session_id, "user", user_input)
         sessions.append_turn(session_id, "assistant", speech_text)
+        try:
+            visitors.note_chat(body.get("userId"), session_id, user_input, speech_text,
+                               visitors.did_from(data))
+        except Exception as e:
+            logger.warning("visitor note failed: %s", e)
         maybe_distill()
 
         return {
@@ -353,6 +386,8 @@ def handle_respond(body: Dict[str, Any]) -> Dict[str, Any]:
                 "posture": data.get("posture"),
                 "gaze": data.get("gaze"),
                 "moveTo": data.get("moveTo"),
+                "action": data.get("action"),
+                "lookUp": data.get("lookUp"),
             },
             "meta": {
                 "sessionId": session_id,
@@ -762,6 +797,23 @@ def _fetch_wiki_summary_by_title(title: str) -> Dict[str, Any] | None:
     return None
 
 
+def _search_wiki_title(query: str) -> str | None:
+    """The best-matching article title for loose words ("black holes")."""
+    try:
+        resp = http_requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={"action": "opensearch", "search": query, "limit": 1,
+                    "namespace": 0, "format": "json"},
+            headers={"User-Agent": WIKIMEDIA_UA}, timeout=10,
+        )
+        resp.raise_for_status()
+        titles = resp.json()[1]
+        return titles[0] if titles else None
+    except Exception as e:
+        logger.warning(f"Wikipedia search failed for {query!r}: {e}")
+        return None
+
+
 def _fetch_wiki_outbound_links(title: str, limit: int = 15) -> list[str]:
     """Fetch outbound (mainspace) Wikipedia article links from a given page.
 
@@ -823,6 +875,11 @@ def handle_browse(body: Dict[str, Any]) -> Dict[str, Any]:
             # Caller asked for a specific page — let the link-following loop
             # land deterministically on the choice it picked.
             article = _fetch_wiki_summary_by_title(requested_title)
+            if article is None:
+                # A visitor's topic, not an exact title: search for it.
+                found = _search_wiki_title(requested_title)
+                if found:
+                    article = _fetch_wiki_summary_by_title(found)
 
         if article is None:
             # Up to 3 attempts to land on a standard article with a usable
@@ -1054,6 +1111,7 @@ def handle_muse(body: Dict[str, Any]) -> Dict[str, Any]:
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 live_block(),
+                *situation_blocks(body),
                 {"role": "user", "content": musing_context},
             ],
             muse_tool,
@@ -1075,6 +1133,57 @@ def handle_muse(body: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Error in muse: {e}")
         return {"error": str(e)}, 500
+
+def _say_to_visitor(body: Dict[str, Any], situation: str):
+    """One line said aloud to the visitor, kept in their session so a reply
+    to it reads as a reply."""
+    session_id = body.get("sessionId", "default")
+    try:
+        data = call_with_schema(
+            get_client(),
+            MODEL_BACKGROUND,
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                live_block(),
+                *situation_blocks(body, visitor=True),
+                *sessions.get_turns(session_id),
+                {"role": "user", "content": f"[{situation} Say it in your voice, 1-2 sentences. "
+                                            "Reply with only what you say.]"},
+            ],
+            say_tool,
+        )
+        text = (data.get("text") or "")[:500]
+        if not text:
+            return {"response": None}, 200
+        sessions.append_turn(session_id, "assistant", text)
+        return {"response": {"text": text, "emotion": resolve_emotion(data.get("emotion"), strength=0.2)}}, 200
+    except Exception as e:
+        logger.error(f"Error in say: {e}")
+        return {"error": str(e)}, 500
+
+
+def handle_greet(body: Dict[str, Any]) -> Dict[str, Any]:
+    """The visitor came back: to the tab after a while, or to the page another day."""
+    try:
+        away = int(body.get("awayMinutes") or 0)
+    except (TypeError, ValueError):
+        away = 0
+    if away > 0:
+        situation = f"The visitor watching you just came back after {away} minutes away. Greet them."
+    elif state.get_store().get_item("VISITOR", body.get("userId") or "-"):
+        situation = "A visitor you've talked to before just opened the page. Greet them, showing you remember."
+    else:
+        return {"response": None}, 200
+    return _say_to_visitor(body, situation)
+
+
+def handle_initiate(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Dave starts the conversation with someone who's been watching quietly."""
+    doing = (body.get("context") or "").strip()[:200]
+    situation = ((f"You are {doing}. " if doing else "")
+                 + "The visitor has been watching you for a while without saying anything. "
+                 "Ask them one short question: about them, or about what you're doing.")
+    return _say_to_visitor(body, situation)
 
 # ── HTML Text Extraction ─────────────────────────────────────────────────────
 
@@ -1377,6 +1486,8 @@ HANDLERS = {
     "muse": handle_muse,
     "browse_url": handle_browse_url,
     "analyze_media": handle_analyze_media,
+    "greet": handle_greet,
+    "initiate": handle_initiate,
 }
 
 def dispatch(body: Dict[str, Any]):
