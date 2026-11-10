@@ -79,7 +79,7 @@ provider:
 
 custom:
   # dance_setup.sh prints this; the launch template the query Lambda may use.
-  danceLaunchTemplateId: lt-CHANGE-ME
+  danceLaunchTemplateId: lt-094149b1e07999763
 
   customDomain:
     domainName: davemind.drawvid.com
