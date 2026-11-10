@@ -59,6 +59,14 @@ def test_one_dance_per_visitor_and_a_daily_cap(stub_llm, aws):
     assert "learn" not in _video(stub_llm, ip="c")[0]  # PER_DAY = 2 reached
 
 
+def test_the_owner_is_not_capped_or_counted(stub_llm, aws, monkeypatch):
+    monkeypatch.setattr(dances, "UNCAPPED_IPS", {"owner"})
+    for _ in range(3):
+        assert "learn" in _video(stub_llm, ip="owner")[0]
+    assert "learn" in _video(stub_llm, ip="a")[0]
+    assert "learn" in _video(stub_llm, ip="b")[0]  # the owner's took none of PER_DAY = 2
+
+
 def test_he_is_told_when_he_cannot_learn_it(stub_llm, aws):
     _video(stub_llm, ip="a")
     _video(stub_llm, ip="a")

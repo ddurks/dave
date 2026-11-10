@@ -39,6 +39,8 @@ LAUNCH_TEMPLATE = "dave-dance"
 
 PER_DAY = int(os.environ.get("DAVE_DANCES_PER_DAY", "5"))
 PER_IP_PER_DAY = int(os.environ.get("DAVE_DANCES_PER_IP_PER_DAY", "1"))
+# The owner's addresses, comma-separated: no caps and not counted against them.
+UNCAPPED_IPS = {a.strip() for a in os.environ.get("DAVE_DANCES_UNCAPPED_IPS", "").split(",") if a.strip()}
 MAX_UPLOAD_BYTES = 60 * 1024 * 1024
 DAY = 86400
 GIVE_UP_S = 45 * 60  # a job this old without a clip has failed
@@ -73,6 +75,8 @@ def _day_count(bucket):
 def why_not(ip):
     """None if a dance could be learned for this visitor now, else the reason:
     "visitor" (they've had today's) or "today" (he's learned enough today)."""
+    if ip in UNCAPPED_IPS:
+        return None
     try:
         if _day_count(f"dance#{ip}") >= PER_IP_PER_DAY:
             return "visitor"
@@ -89,17 +93,18 @@ def reserve(ip):
     Returns {"jobId", "upload": {"url", "fields"}}, or None if over a cap."""
     if not ip:
         return None
-    try:
-        # The visitor's own allowance first, so their retries only ever burn
-        # their own count and never the day's for everyone else.
-        if state.hit(f"dance#{ip}", DAY) > PER_IP_PER_DAY:
+    if ip not in UNCAPPED_IPS:
+        try:
+            # The visitor's own allowance first, so their retries only ever burn
+            # their own count and never the day's for everyone else.
+            if state.hit(f"dance#{ip}", DAY) > PER_IP_PER_DAY:
+                return None
+            everyone = state.hit("dance#all", DAY)
+        except Exception as e:
+            logger.error("dance caps unavailable: %s", e)
             return None
-        everyone = state.hit("dance#all", DAY)
-    except Exception as e:
-        logger.error("dance caps unavailable: %s", e)
-        return None
-    if everyone > PER_DAY:
-        return None
+        if everyone > PER_DAY:
+            return None
     job = uuid.uuid4().hex[:12]
     upload = s3().generate_presigned_post(
         DANCE_BUCKET, f"in/{job}",
@@ -108,7 +113,8 @@ def reserve(ip):
         ExpiresIn=600,
     )
     state.get_store().put_item("DANCE", job, {"status": "upload", "createdAt": int(time.time())})
-    logger.info("dance %s reserved (%d today)", job, everyone)
+    logger.info("dance %s reserved (%s)", job,
+                "uncapped" if ip in UNCAPPED_IPS else f"{everyone} today")
     return {"jobId": job, "upload": upload}
 
 
