@@ -187,15 +187,41 @@ export class DaveMindClient {
     };
   }
 
-  async analyzeMedia(imageData, mediaType = "image") {
+  /**
+   * @param {string|string[]} imageData - one data URL, or a video's stills in order
+   * @param {boolean} learnable - a video small enough to upload, should it be a dance
+   * @returns {object} { response, learn } — `learn` ({ jobId, upload }) when
+   *   he's going to learn the dance in it
+   */
+  async analyzeMedia(imageData, mediaType = "image", learnable = false) {
+    const frames = [].concat(imageData);
     const data = await this._post({
       type: "analyze_media",
-      imageData,
+      imageData: frames[0],
+      ...(frames.length > 1 && { frames }),
       mediaType,
+      learnable,
       sessionId: this.sessionId,
       userId: this.userId,
     });
-    return { response: data.response || null };
+    return { response: data.response || null, learn: data.learn || null };
+  }
+
+  /** The dance video is uploaded; start learning it. @returns {string} status */
+  async startDance(jobId) {
+    const data = await this._post({ type: "dance_start", jobId });
+    return data.status || "failed";
+  }
+
+  /** @returns {object} { status: "learning" | "done" | "failed", url? } */
+  async danceStatus(jobId) {
+    return this._post({ type: "dance_status", jobId });
+  }
+
+  /** Every dance he's learned: [{ id, url }]. */
+  async dances() {
+    const data = await this._post({ type: "dances" });
+    return data.dances || [];
   }
 
   /**

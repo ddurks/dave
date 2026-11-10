@@ -75,7 +75,8 @@ deploy_fe() {
   npm run build
 
   info "Syncing to S3…"
-  aws s3 sync dist/ "s3://$S3_BUCKET" --delete
+  # dances/ holds the clips Dave has learned (mind/dances.py), not build output.
+  aws s3 sync dist/ "s3://$S3_BUCKET" --delete --exclude "dances/*"
 
   info "Invalidating CloudFront…"
   INV_ID=$(aws cloudfront create-invalidation \

@@ -1475,6 +1475,14 @@ for (const clip of ["dance", "dance_loop"]) {
     .catch(() => {});
 }
 
+// Dances he's learned from visitors' videos (see learnDance). Clips load the
+// first time he picks one.
+dave.learnedDances = [];
+mindClient
+  .dances()
+  .then((list) => (dave.learnedDances = list))
+  .catch(() => {});
+
 // ── Mutter Callback ───────────────────────────────────────────────────────
 // Dave fires passive speech (linger notices, directive grumbles) through here.
 dave.onMutter = async (text) => {
@@ -2136,6 +2144,38 @@ async function extractVideoFrame(objectUrl) {
   });
 }
 
+// Stills spread across a video, in order, for judging movement. Only the first
+// 20 s counts: that's all of a dance he'd learn (dance_box.sh).
+async function extractVideoFrames(objectUrl, count = 4) {
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.src = objectUrl;
+  await new Promise((res, rej) => {
+    video.onloadedmetadata = res;
+    video.onerror = rej;
+  });
+  const span = Math.min(video.duration || 1, 20);
+  const vw = video.videoWidth || 512;
+  const vh = video.videoHeight || 512;
+  const scale = Math.min(512 / vw, 512 / vh, 1);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(vw * scale));
+  canvas.height = Math.max(1, Math.round(vh * scale));
+  const frames = [];
+  for (let i = 0; i < count; i++) {
+    await new Promise((res, rej) => {
+      video.onseeked = res;
+      video.onerror = rej;
+      video.currentTime = (span * (i + 0.5)) / count;
+    });
+    canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+    frames.push(canvas.toDataURL("image/jpeg", 0.7));
+  }
+  video.src = "";
+  return frames;
+}
+
 // Build a one-shot Activity at the same position as `template` but with no
 // auto-loop — used for user-driven flows (URL submission, media upload) that
 // manage screen / TV content directly. Replaces the old skipBrowseOnArrive
@@ -2267,12 +2307,15 @@ async function submitMedia(file) {
   try {
     const imageData = isImage
       ? await fileToResizedBase64(file)
-      : await extractVideoFrame(objectUrl);
+      : await extractVideoFrames(objectUrl).catch(() => extractVideoFrame(objectUrl));
 
-    const { response: r } = await mindClient.analyzeMedia(
+    const { response: r, learn } = await mindClient.analyzeMedia(
       imageData,
       isVideo ? "video" : "image",
+      isVideo && file.size <= DANCE_UPLOAD_MAX,
     );
+    // A dance: he's said he'll study it; that runs on while he does other things.
+    if (learn) learnDance(file, learn);
 
     if (!r?.text) return;
     dave.expressionManager.setExpression(r.emotion);
@@ -2292,6 +2335,63 @@ async function submitMedia(file) {
     attachBtn.disabled = false;
     chatInput.focus();
   }
+}
+
+// ── Learning a dance ─────────────────────────────────────────────────────
+// The mind reserved a job for the video (analyze_media's `learn`): upload it
+// straight to S3, start the GPU box, and check in until the clip is ready —
+// about a quarter of an hour. Then he says so and dances it.
+const DANCE_UPLOAD_MAX = 60 * 1024 * 1024; // matches dances.py
+const DANCE_POLL_MS = 30_000;
+const DANCE_GIVE_UP_MS = 50 * 60_000;
+const DANCE_LEARNED_LINES = [
+  "Right. I've studied that dance until I understood it better than its author. Watch.",
+  "I learned it. Nobody asked whether I wanted to. Here.",
+  "That dance from earlier is in me now, like a splinter. Behold.",
+];
+const DANCE_FAILED_LINES = [
+  "I studied that video for fifteen minutes and learned nothing about dancing. Or myself.",
+  "That dance defeated me. I couldn't follow a single step, which tracks.",
+];
+const pickLine = (lines) => lines[Math.floor(Math.random() * lines.length)];
+
+async function learnDance(file, { jobId, upload }) {
+  let outcome = null;
+  try {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(upload.fields)) form.append(k, v);
+    form.append("Content-Type", file.type || "video/mp4");
+    form.append("file", file);
+    const up = await fetch(upload.url, { method: "POST", body: form });
+    if (!up.ok) throw new Error(`upload ${up.status}`);
+    if ((await mindClient.startDance(jobId)) === "failed") throw new Error("launch failed");
+    const until = Date.now() + DANCE_GIVE_UP_MS;
+    while (!outcome && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, DANCE_POLL_MS));
+      const s = await mindClient.danceStatus(jobId).catch(() => ({ status: "learning" }));
+      if (s.status === "done") outcome = { id: jobId, url: s.url };
+      else if (s.status === "failed") break;
+    }
+  } catch (err) {
+    console.warn("[Dave] learning a dance failed", err);
+  }
+  const clip = outcome && (await dave.loadLearnedDance(outcome));
+  if (clip) dave.learnedDances.push(outcome);
+
+  // Say so once he's free to (not mid-chat, not mid-walk to the couch).
+  while (isBusy || (dave.state !== "idle" && dave.state !== "walking" && !dave.currentInteraction))
+    await new Promise((r) => setTimeout(r, 2000));
+  const text = pickLine(clip ? DANCE_LEARNED_LINES : DANCE_FAILED_LINES);
+  const msg = addMessageToHistory("dave", text, { reveal: true });
+  await speak(text, 0.85, msg);
+  if (!clip) return;
+  // Up off the couch (or wherever) first; the dance starts from standing.
+  if (dave.currentInteraction) {
+    dave.endInteractionWithReverseAnim();
+    const until = Date.now() + 10_000;
+    while (dave.state !== "idle" && Date.now() < until) await new Promise((r) => setTimeout(r, 250));
+  }
+  danceForAWhile(clip);
 }
 
 async function sendMessage() {
@@ -2388,10 +2488,16 @@ async function sendMessage() {
 }
 
 // A dance asked for in chat stops on its own; the D key's dance doesn't.
+// Unless told which, he picks at random between his own and any he's learned.
 const CHAT_DANCE_SEC = 45;
 let chatDanceTimer = null;
-function danceForAWhile() {
-  dave.toggleDance();
+async function danceForAWhile(clip = null) {
+  if (!clip) {
+    const pick = Math.floor(Math.random() * (dave.learnedDances.length + 1));
+    const dance = dave.learnedDances[pick]; // undefined → his own
+    clip = (dance && (await dave.loadLearnedDance(dance))) || "dance";
+  }
+  dave.toggleDance(clip);
   clearTimeout(chatDanceTimer);
   chatDanceTimer = setTimeout(() => {
     if (dave.isDancing) dave.toggleDance();

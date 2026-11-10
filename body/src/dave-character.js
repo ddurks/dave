@@ -80,8 +80,9 @@ const ACTION_DEFS = {
   chug: { anim: null, loop: false, expression: null, blocksHead: true },
 };
 
-// Dance clips from tinydancer: the full take and its seamless loop
-const DANCE_CLIPS = ["dance", "dance_loop"];
+// Dance clips from tinydancer: the full take and its seamless loop, plus any
+// he's learned from visitors' videos ("dance_learned_<id>", see loadLearnedDance).
+const isDanceClip = (name) => name === "dance" || name === "dance_loop" || !!name?.startsWith("dance_learned_");
 const BUZZ_WINDOW_MS = 8 * 60 * 1000; // a beer wears off after this long
 
 // Expressions while dancing (see _tickDanceCues)
@@ -1215,7 +1216,39 @@ export class Dave {
   }
 
   get isDancing() {
-    return DANCE_CLIPS.includes(this.animationController.currentAnimName);
+    return isDanceClip(this.animationController.currentAnimName);
+  }
+
+  /**
+   * Make a learned dance playable: load its clip-only glb (tinydancer's
+   * dave_dance.py, same node names as davebot.glb) and bind each track to
+   * Dave's node of the same name. Returns its clip name for toggleDance, or
+   * null if it wouldn't load. Loaded once per page.
+   * @param {object} dance - { id, url } from the mind's dance catalog
+   */
+  async loadLearnedDance({ id, url }) {
+    const name = `dance_learned_${id}`;
+    if (this.ANIM_MAP[name]) return name;
+    try {
+      const container = await BABYLON.SceneLoader.LoadAssetContainerAsync(url, "", this.scene);
+      const src = container.animationGroups[0];
+      if (!src) return null;
+      const group = new BABYLON.AnimationGroup(name, this.scene);
+      for (const ta of src.targetedAnimations) {
+        const target = ta.target?.name;
+        // Eyes stay the gaze system's, as in his own clips.
+        if (target === "eyeball.l" || target === "eyeball.r") continue;
+        const node = this.findTransformNode(target);
+        if (node) group.addTargetedAnimation(ta.animation, node);
+      }
+      container.dispose();
+      if (!group.targetedAnimations.length) return null;
+      this.ANIM_MAP[name] = group;
+      return name;
+    } catch (err) {
+      console.warn(`[Dave] learned dance ${id} failed to load`, err);
+      return null;
+    }
   }
 
   /** The dance clip playing, or the full dance when not dancing. */

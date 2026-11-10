@@ -26,6 +26,7 @@ import mood
 import state
 import state_config
 import budget
+import dances
 import ratelimit
 import sessions as session_store
 import turnlog
@@ -40,6 +41,7 @@ from tools import (
     browse_react_tool,
     browse_choose_tool,
     distill_tool,
+    media_react_tool,
     muse_tool,
     say_tool,
 )
@@ -152,6 +154,19 @@ IDLE_PROMPT = PROMPTS['idle_prompt']
 BROWSE_PICK_PROMPT = PROMPTS['browse_pick_prompt']
 BROWSE_REACT_PROMPT = PROMPTS['browse_react_prompt']
 DISTILL_PROMPT = PROMPTS['distill_prompt']
+
+# What he knows about learning the dance in a video, keyed by dances.why_not
+# (plus "big": the file is too large to send).
+DANCE_LEARN_NOTES = {
+    None: ("You can learn a dance by watching it. If this is someone dancing, whole body "
+           "in view, say you'll study it and try it yourself in a quarter of an hour."),
+    "visitor": ("You can learn dances by watching them, but you've already learned one from this "
+                "visitor today. If this is dancing, say you won't learn another of theirs until tomorrow."),
+    "today": ("You can learn dances by watching them, but you've learned all you can manage today. "
+              "If this is dancing, say it'll have to wait until tomorrow."),
+    "big": ("You can learn dances by watching them, but this video is too long a file to study. "
+            "If this is dancing, say so and ask for a shorter clip."),
+}
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1380,15 +1395,27 @@ def handle_browse_url(body: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handle_analyze_media(body: Dict[str, Any]) -> Dict[str, Any]:
-    """Analyze an image or video frame and have Dave react to it."""
-    image_data = body.get("imageData") or ""
-    if not image_data:
+    """Analyze an image or video and have Dave react to it. A video comes as
+    `frames`, a few stills spread across it, so movement can be judged."""
+    media_type = body.get("mediaType", "image")
+    frames = body.get("frames") if media_type == "video" else None
+    if not isinstance(frames, list) or not frames:
+        frames = [body.get("imageData") or ""]
+    frames = [f for f in frames[:4] if isinstance(f, str) and f]
+    if not frames:
         return {"error": "imageData is required"}, 400
-    if len(image_data) > 2_000_000:
+    if sum(len(f) for f in frames) > 2_000_000:
         return {"error": "image too large"}, 400
 
-    media_type = body.get("mediaType", "image")
-    thing = "video frame" if media_type == "video" else "image"
+    thing = "video" if len(frames) > 1 else "video frame" if media_type == "video" else "image"
+    shown = (f"; here are {len(frames)} stills spread across it, in order. Talk about the "
+             f"video, not the stills" if len(frames) > 1 else "")
+    # A video of someone dancing is one he can learn (dances.py). He's told
+    # up front whether he can, so what he says matches what happens.
+    learn_note = ""
+    if media_type == "video":
+        blocked = "big" if not body.get("learnable") else dances.why_not(body.get("_ip"))
+        learn_note = "\n\n" + DANCE_LEARN_NOTES[blocked]
 
     try:
         react = call_with_schema(
@@ -1404,18 +1431,16 @@ def handle_analyze_media(body: Dict[str, Any]) -> Dict[str, Any]:
                         {
                             "type": "text",
                             "text": (
-                                f"[D.A.V.E. is looking at a {thing} someone just put on his TV]\n\n"
+                                f"[D.A.V.E. is looking at a {thing} someone just put on his TV{shown}]\n\n"
                                 f"Describe in one sentence what you see, then react to it in D.A.V.E.'s sardonic style."
+                                f"{learn_note}"
                             ),
                         },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": image_data},
-                        },
+                        *({"type": "image_url", "image_url": {"url": f}} for f in frames),
                     ],
                 },
             ],
-            browse_react_tool,
+            media_react_tool if media_type == "video" else browse_react_tool,
         )
 
         if not react.get("text") and react.get("_raw_text"):
@@ -1431,7 +1456,12 @@ def handle_analyze_media(body: Dict[str, Any]) -> Dict[str, Any]:
                 "gaze": react.get("gaze"),
             }
 
-        return {"response": response}, 200
+        out = {"response": response}
+        if media_type == "video" and react.get("dancing") and body.get("learnable"):
+            learn = dances.reserve(body.get("_ip"))
+            if learn:
+                out["learn"] = learn
+        return out, 200
 
     except Exception as e:
         logger.warning(f"analyze_media failed (returning safe fallback): {e}")
@@ -1477,6 +1507,20 @@ def _log_result(req_type: str, result: dict) -> str:
     return f"[{req_type}] {str(result)[:100]}"
 
 
+def handle_dance_start(body: Dict[str, Any]) -> Dict[str, Any]:
+    """The visitor's dance video is uploaded: start learning it."""
+    return dances.start(body.get("jobId"))
+
+
+def handle_dance_status(body: Dict[str, Any]) -> Dict[str, Any]:
+    return dances.status(body.get("jobId"))
+
+
+def handle_dances(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Every dance he's learned, for the page to pick from."""
+    return dances.catalog()
+
+
 HANDLERS = {
     "respond": handle_respond,
     "idle": handle_idle,
@@ -1488,15 +1532,20 @@ HANDLERS = {
     "analyze_media": handle_analyze_media,
     "greet": handle_greet,
     "initiate": handle_initiate,
+    "dance_start": handle_dance_start,
+    "dance_status": handle_dance_status,
+    "dances": handle_dances,
 }
 
-def dispatch(body: Dict[str, Any]):
-    """Route a request body to the appropriate handler"""
+def dispatch(body: Dict[str, Any], ip: str = ""):
+    """Route a request body to the appropriate handler. `ip` is the caller's
+    address as the server saw it; handlers get it as `_ip`, overwriting any
+    the client sent, and it stays out of the turn log."""
     req_type = body.get("type", "").lower()
     handler = HANDLERS.get(req_type)
     if not handler:
         return {"error": f"Unknown type: {req_type}"}, 400
-    result, status = handler(body)
+    result, status = handler({**body, "_ip": ip})
     logger.info(_log_result(req_type, result))
     turn_logger.log(req_type, body, result, status)
     return result, status
@@ -1512,7 +1561,7 @@ def query():
         limited = ratelimit.check(request.remote_addr or "", str(body.get("type", "")).lower())
         if limited:
             return jsonify({"error": limited}), 429
-        result, status = dispatch(body)
+        result, status = dispatch(body, request.remote_addr or "")
         return jsonify(result), status
     except Exception as e:
         logger.error(f"Error in /query: {e}")
@@ -1660,7 +1709,7 @@ def lambda_handler(event, context):
                 "headers": {"Content-Type": "application/json", **cors_headers},
                 "body": json.dumps({"error": limited}),
             }
-        result, status = dispatch(body)
+        result, status = dispatch(body, source_ip)
         return {
             "statusCode": status,
             "headers": {"Content-Type": "application/json", **cors_headers},

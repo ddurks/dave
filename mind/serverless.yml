@@ -23,8 +23,64 @@ provider:
             - dynamodb:DeleteItem
             - dynamodb:Query
           Resource: arn:aws:dynamodb:us-east-1:593615615124:table/dave-mind
+        # Learning dances (dances.py; AWS side made by dance_setup.sh). The
+        # page uploads a visitor's video with a POST this role presigns.
+        - Effect: Allow
+          Action: [s3:PutObject, s3:GetObject]
+          Resource: arn:aws:s3:::dave-dance-593615615124/in/*
+        - Effect: Allow
+          Action: s3:ListBucket
+          Resource: arn:aws:s3:::dave-drawvid-frontend
+          Condition:
+            StringLike:
+              s3:prefix: "dances/*"
+        - Effect: Allow
+          Action: s3:GetObject
+          Resource: arn:aws:s3:::dave-drawvid-frontend/dances/*
+        # Launch only g5.xlarge, only from the dave-dance launch template.
+        - Effect: Allow
+          Action: ec2:RunInstances
+          Resource: arn:aws:ec2:us-east-1:593615615124:instance/*
+          Condition:
+            StringEquals:
+              ec2:InstanceType: g5.xlarge
+            ArnEquals:
+              ec2:LaunchTemplate: arn:aws:ec2:us-east-1:593615615124:launch-template/${self:custom.danceLaunchTemplateId}
+        - Effect: Allow
+          Action: ec2:RunInstances
+          Resource:
+            - arn:aws:ec2:us-east-1:593615615124:launch-template/${self:custom.danceLaunchTemplateId}
+            - arn:aws:ec2:us-east-1:593615615124:volume/*
+            - arn:aws:ec2:us-east-1:593615615124:network-interface/*
+            - arn:aws:ec2:us-east-1:593615615124:subnet/*
+            - arn:aws:ec2:us-east-1:593615615124:security-group/*
+            - arn:aws:ec2:us-east-1::image/*
+        - Effect: Allow
+          Action: ec2:CreateTags
+          Resource:
+            - arn:aws:ec2:us-east-1:593615615124:instance/*
+            - arn:aws:ec2:us-east-1:593615615124:volume/*
+          Condition:
+            StringEquals:
+              ec2:CreateAction: RunInstances
+        - Effect: Allow
+          Action: iam:PassRole
+          Resource: arn:aws:iam::593615615124:role/dave-dance-box
+        - Effect: Allow
+          Action: ec2:DescribeInstances
+          Resource: "*"
+        # The sweeper may only terminate dance boxes.
+        - Effect: Allow
+          Action: ec2:TerminateInstances
+          Resource: arn:aws:ec2:us-east-1:593615615124:instance/*
+          Condition:
+            StringEquals:
+              ec2:ResourceTag/App: dave-dance
 
 custom:
+  # dance_setup.sh prints this; the launch template the query Lambda may use.
+  danceLaunchTemplateId: lt-CHANGE-ME
+
   customDomain:
     domainName: davemind.drawvid.com
     certificateArn: arn:aws:acm:us-east-1:593615615124:certificate/4f50765a-0d38-41ba-9651-0bf09aa5f0d4
@@ -72,6 +128,7 @@ functions:
     package:
       patterns:
         - "!videoproxy.js"
+        - "!dance_setup.sh"
     events:
       - http:
           path: query
@@ -81,6 +138,17 @@ functions:
           path: health
           method: get
           cors: true
+
+  # Terminates any dance-learning box that outlives its own shutdown timer.
+  dancesweep:
+    handler: dances.sweep
+    timeout: 30
+    events:
+      - schedule: rate(10 minutes)
+    package:
+      patterns:
+        - "!videoproxy.js"
+        - "!dance_setup.sh"
 
   # CORS streaming proxy for Internet Archive videos. A Lambda Function URL in
   # RESPONSE_STREAM mode — API Gateway can't stream and caps payloads at ~10 MB,

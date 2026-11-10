@@ -152,6 +152,20 @@ browse_react_tool = {
     },
 }
 
+# A video someone put on his TV: browse_react plus whether it's a dance he
+# could learn (dances.py).
+media_react_tool = deepcopy(browse_react_tool)
+media_react_tool["function"]["description"] = "React to a video someone put on D.A.V.E.'s TV."
+media_react_tool["function"]["parameters"]["properties"]["dancing"] = {
+    "type": "boolean",
+    "description": "True only if real people are clearly dancing, with at least one dancer's "
+                   "whole body in view through the stills (others dancing alongside or standing "
+                   "around are fine): posed or moving differently from still to still, not "
+                   "standing, walking, singing, playing instruments or sport, and not a cartoon. "
+                   "False if anything in it is sexual or violent.",
+}
+media_react_tool["function"]["parameters"]["required"].append("dancing")
+
 muse_tool = {
     "type": "function",
     "function": {
