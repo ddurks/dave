@@ -19,7 +19,8 @@ SITE_BUCKET="__SITE_BUCKET__"
 TD_BUCKET="__TD_BUCKET__"
 export AWS_DEFAULT_REGION="__REGION__"
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-BLENDER_URL="https://download.blender.org/release/Blender5.1/blender-5.1.1-linux-x64.tar.xz"
+# A copy in the kit (dance_setup.sh): download.blender.org answers 403 to EC2.
+BLENDER_TAR="blender-5.1.1-linux-x64.tar.xz"
 LOG=/var/log/dance.log
 exec > >(tee "$LOG") 2>&1
 
@@ -34,7 +35,7 @@ trap finish EXIT
 ( while true; do sleep 60; aws s3 cp "$LOG" "s3://$DANCE_BUCKET/logs/$JOB.log" >/dev/null 2>&1 || true; done ) &
 
 # Blender downloads while GVHMR installs.
-( curl -fsSL "$BLENDER_URL" | tar xJ -C /opt && mv /opt/blender-* /opt/blender ) &
+( aws s3 cp --quiet "s3://$DANCE_BUCKET/kit/$BLENDER_TAR" - | tar xJ -C /opt && mv /opt/blender-* /opt/blender ) &
 BLENDER_PID=$!
 
 # This AMI's system Python is 3.10 (matches GVHMR's cp310 wheels); `python` needs

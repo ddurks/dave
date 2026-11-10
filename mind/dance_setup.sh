@@ -6,7 +6,7 @@
 #
 # Creates:
 #   - bucket dave-dance-<account>: in/ (visitors' videos, gone after a day),
-#     logs/ (box logs, 30 days), kit/ (tinydancer's scripts for the box)
+#     logs/ (box logs, 30 days), kit/ (tinydancer's scripts and Blender for the box)
 #   - role + instance profile dave-dance-box: the box may read its video, the
 #     kit, GVHMR's checkpoints and davebot.glb, and write only its log and
 #     dances/*.glb on the site bucket
@@ -47,6 +47,15 @@ for f in $KIT_FILES; do [ -f "$TD/$f" ] || { echo "Missing $TD/$f"; exit 1; }; d
 # shellcheck disable=SC2086
 tar czf - -C "$TD" $KIT_FILES | aws s3 cp - "s3://$BUCKET/kit/tinydancer.tgz"
 echo "Uploaded kit from $TD ($(git -C "$TD" rev-parse --short HEAD 2>/dev/null || echo '?'))."
+
+# download.blender.org answers 403 to EC2 addresses, so the box gets Blender
+# from the kit. Must match BLENDER_TAR in dance_box.sh.
+BLENDER_TAR="blender-5.1.1-linux-x64.tar.xz"
+if ! aws s3api head-object --bucket "$BUCKET" --key "kit/$BLENDER_TAR" >/dev/null 2>&1; then
+  echo "Copying $BLENDER_TAR into the kit ..."
+  curl -fsSL "https://download.blender.org/release/Blender5.1/$BLENDER_TAR" \
+    | aws s3 cp - "s3://$BUCKET/kit/$BLENDER_TAR" --expected-size 400000000
+fi
 
 # --- the box's role --------------------------------------------------------------
 if ! aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then

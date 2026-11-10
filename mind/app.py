@@ -1408,8 +1408,9 @@ def handle_analyze_media(body: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "image too large"}, 400
 
     thing = "video" if len(frames) > 1 else "video frame" if media_type == "video" else "image"
-    shown = (f"; here are {len(frames)} stills spread across it, in order. Talk about the "
-             f"video, not the stills" if len(frames) > 1 else "")
+    shown = (f" and has watched it through; the {len(frames)} images are moments from it, in "
+             f"order. React as someone who watched the video: never mention stills, frames, "
+             f"images or snapshots" if len(frames) > 1 else "")
     # A video of someone dancing is one he can learn (dances.py). He's told
     # up front whether he can, so what he says matches what happens.
     learn_note = ""
