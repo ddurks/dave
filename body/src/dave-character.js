@@ -80,6 +80,19 @@ const ACTION_DEFS = {
   chug: { anim: null, loop: false, expression: null, blocksHead: true },
 };
 
+// Dance clips from tinydancer: the full take and its seamless loop
+const DANCE_CLIPS = ["dance", "dance_loop"];
+const BUZZ_WINDOW_MS = 8 * 60 * 1000; // a beer wears off after this long
+
+// Expressions while dancing (see _tickDanceCues)
+const DANCE_BEAT_FACES = [
+  "dry-amusement",
+  "fleeting-curiosity",
+  "reluctant-affection",
+  "neutral",
+];
+const DANCE_KEYPOSE_FACES = ["weary-contempt", "existential-dread"];
+
 export class Dave {
   /**
    * Constructor
@@ -178,7 +191,7 @@ export class Dave {
     this.sitAnim = this.findAnim("sit");
     this.laydownAnim = this.findAnim("laydown") || this.findAnim("lay");
     this.chugAnim = this.findAnim("chug");
-    this.thinkingAnim = this.findAnim("thinking");
+    this.thinkingAnim = this.findAnim("think"); // the clip is named "think"
 
     this.ANIM_MAP = {
       idle: this.idleAnim,
@@ -186,6 +199,9 @@ export class Dave {
       laydown: this.laydownAnim,
       chug: this.chugAnim,
       thinking: this.thinkingAnim,
+      // Exact names: findAnim's substring match would confuse these two
+      dance: animGroups.find((a) => a.name === "dance"),
+      dance_loop: animGroups.find((a) => a.name === "dance_loop"),
     };
 
     // Animation controller manages all playback
@@ -290,6 +306,8 @@ export class Dave {
     this.lastAction = null; // e.g. "sitting on couch", "browsing", "talking"
     this.lastChatTime = Date.now();
     this._idleRequestPending = false;
+    this.beerTimes = []; // when each recent beer went down (see buzz)
+    this.cursorTarget = null; // world point under the visitor's cursor, set by the scene
     this.userPresent = true; // Whether the user's tab is active/visible
 
     // ── Talking State ────────────────────────────────────────────────────────
@@ -603,8 +621,10 @@ export class Dave {
 
     this.mindClient
       .idle(context)
-      .then((directive) => this._applyIdleDirective(directive))
-      .catch(() => this._fallbackWander())
+      // A directive landing while something scripted (film mode) is running
+      // Dave would yank him out of it — drop it.
+      .then((directive) => !this.scripted && this._applyIdleDirective(directive))
+      .catch(() => !this.scripted && this._fallbackWander())
       .finally(() => {
         this._idleRequestPending = false;
       });
@@ -689,7 +709,11 @@ export class Dave {
       this.startRandomInteraction(10 + Math.random() * 20);
       return;
     }
+    this.walkSomewhere();
+  }
 
+  /** Walk to a random point in the room. */
+  walkSomewhere() {
     this.wanderTarget = new BABYLON.Vector3(
       (Math.random() - 0.5) * 2 * this.WANDER_BOUNDS,
       0,
@@ -776,8 +800,20 @@ export class Dave {
   updateEyeLookAt(dt) {
     if (!this.eyesReady) return;
 
-    if (this.state === S.TALKING || this.state === S.TURNING_TO_CAMERA) {
+    if (this.isDancing) {
+      // Play to the camera: eyes locked on it the whole dance, no easing lag
+      // (see _aimHeadAt)
+      this.eyeLookAtTarget = (this.danceLookTarget ?? this.camera.position).clone();
+      this.eyeLookAtWorld.copyFrom(this.eyeLookAtTarget);
+    } else if (this.gazeOverride) {
+      // Something scripted (e.g. film mode) wants his eyes on a point
+      this.eyeLookAtTarget = this.gazeOverride.clone();
+    } else if (this.state === S.TALKING || this.state === S.TURNING_TO_CAMERA) {
       this.eyeLookAtTarget = this.camera.position.clone();
+    } else if (this.cursorTarget && !this.isBrowsing) {
+      // The visitor is moving their cursor: watch it
+      this.eyeLookAtTarget = this.cursorTarget.clone();
+      this.gazeTimer = 0.5; // back to his own gaze soon after it stops
     } else if (this.isBrowsing && this.screenMesh) {
       this.gazeTimer -= dt;
       if (this.gazeTimer <= 0) {
@@ -874,20 +910,26 @@ export class Dave {
     const posR = this.eyeballNodeR.getAbsolutePosition();
     const midpoint = posL.add(posR).scale(0.5);
 
-    const delta = this.computeGazeDelta(
-      this.eyeLRestQuat,
-      new BABYLON.Vector3(0, 1, 0),
-      midpoint,
-      this.eyeLookAtWorld,
-      this.MAX_EYE_ANGLE,
-      this.eyeballNodeL,
-      { axis: this.EYE_UP_AXIS_LOCAL, maxAngle: this.MAX_EYE_UP_ANGLE },
-    );
+    const gaze = (from, restQuat, node) =>
+      this.computeGazeDelta(
+        restQuat,
+        new BABYLON.Vector3(0, 1, 0),
+        from,
+        this.eyeLookAtWorld,
+        this.MAX_EYE_ANGLE,
+        node,
+        { axis: this.EYE_UP_AXIS_LOCAL, maxAngle: this.MAX_EYE_UP_ANGLE },
+      );
+    const delta = gaze(midpoint, this.eyeLRestQuat, this.eyeballNodeL);
     if (!delta) return;
+    // While dancing each eye aims from its own position, so both converge on
+    // the camera instead of looking parallel past it.
+    const deltaL = this.isDancing ? gaze(posL, this.eyeLRestQuat, this.eyeballNodeL) ?? delta : delta;
+    const deltaR = this.isDancing ? gaze(posR, this.eyeRRestQuat, this.eyeballNodeR) ?? delta : delta;
 
     const slerp = 1.0 - Math.pow(0.001, dt);
-    const desiredL = delta.multiply(this.eyeLRestQuat);
-    const desiredR = delta.multiply(this.eyeRRestQuat);
+    const desiredL = deltaL.multiply(this.eyeLRestQuat);
+    const desiredR = deltaR.multiply(this.eyeRRestQuat);
     this.eyeballNodeL.rotationQuaternion = BABYLON.Quaternion.Slerp(
       this.eyeballNodeL.rotationQuaternion || this.eyeLRestQuat,
       desiredL,
@@ -905,7 +947,10 @@ export class Dave {
     if (!this.headNode || !this.headRestQuat) return;
 
     // Skip head tracking during actions that control the head (declared in ACTION_DEFS)
-    if (this.currentAction && ACTION_DEFS[this.currentAction]?.blocksHead) {
+    if (
+      this.isDancing ||
+      (this.currentAction && ACTION_DEFS[this.currentAction]?.blocksHead)
+    ) {
       this.headAnimBase = null; // Reset base for smooth resume
       return;
     }
@@ -1154,6 +1199,143 @@ export class Dave {
     if (def.expression) {
       this.expressionManager.setExpression(def.expression);
     }
+  }
+
+  // ── Dance ────────────────────────────────────────────────────────────────
+  // The dance clip (mocap retargeted by tinydancer) drives the whole body, so
+  // the gait and head tracking stand down while it plays. Dancing is just
+  // "the dance clip is playing": anything that plays another clip (a chat,
+  // a wander) ends it and everything resumes.
+  // Beers in the last BUZZ_WINDOW_MS, capped at 3: 1 a beer, 2 tipsy, 3 drunk.
+  // Slurs his speech, wobbles his walk and loosens his lines (see the mind).
+  get buzz() {
+    const since = Date.now() - BUZZ_WINDOW_MS;
+    this.beerTimes = this.beerTimes.filter((t) => t > since);
+    return Math.min(this.beerTimes.length, 3);
+  }
+
+  get isDancing() {
+    return DANCE_CLIPS.includes(this.animationController.currentAnimName);
+  }
+
+  /** The dance clip playing, or the full dance when not dancing. */
+  get danceAnim() {
+    return this.ANIM_MAP[this.isDancing ? this.animationController.currentAnimName : "dance"];
+  }
+
+  /**
+   * Turn the head so the face points straight at `target`, on top of the
+   * current (dance) pose, so Dave plays to the camera. The animation rewrites
+   * the head every frame, so this is applied fresh each frame after it runs.
+   * "The face" is the line from between the eyes to the rig's lookTarget.eyes
+   * bone, aimed from the eyes (not the neck pivot) — two passes settle the
+   * parallax between the two. At most `maxAngle` radians off the pose.
+   */
+  _aimHeadAt(target, maxAngle = 1.8) {
+    const head = this.headNode;
+    const look = (this._lookTargetNode ??= this.findTransformNode("lookTarget.eyes"));
+    if (!head?.parent || !look || !this.eyeballNodeL || !this.eyeballNodeR) return;
+    const base =
+      head.rotationQuaternion ?? BABYLON.Quaternion.FromEulerVector(head.rotation);
+    let budget = maxAngle;
+    for (let pass = 0; pass < 2; pass++) {
+      head.computeWorldMatrix(true);
+      [look, this.eyeballNodeL, this.eyeballNodeR].forEach((n) => n.computeWorldMatrix(true));
+      const eyes = this.eyeballNodeL
+        .getAbsolutePosition()
+        .add(this.eyeballNodeR.getAbsolutePosition())
+        .scale(0.5);
+      const toParent = BABYLON.Matrix.Invert(head.parent.getWorldMatrix());
+      const fwd = BABYLON.Vector3.TransformNormal(
+        look.getAbsolutePosition().subtract(eyes),
+        toParent,
+      ).normalize();
+      const dir = BABYLON.Vector3.TransformNormal(target.subtract(eyes), toParent).normalize();
+      const angle = Math.acos(clamp(BABYLON.Vector3.Dot(fwd, dir), -1, 1));
+      const axis = BABYLON.Vector3.Cross(fwd, dir);
+      if (angle < 0.001 || axis.lengthSquared() < 1e-9) break;
+      const turn = Math.min(angle, budget);
+      budget -= turn;
+      const q = head.rotationQuaternion ?? base;
+      head.rotationQuaternion = BABYLON.Quaternion.RotationAxis(axis.normalize(), turn).multiply(q);
+    }
+  }
+
+  /**
+   * Change expression on the dance's cues (`danceCues[clip]`, from
+   * tinydancer's dance_cues.py): each beat steps through a light set, each key
+   * pose — the dancer hitting a pose — snaps to a punchy one held briefly so
+   * the next beat doesn't stomp it. Deadpan faces on a full-energy dance.
+   */
+  _tickDanceCues() {
+    const cues = this.danceCues?.[this.animationController.currentAnimName];
+    const anim = this.danceAnim;
+    const fps = anim?.targetedAnimations[0]?.animation.framePerSecond;
+    const frame = anim?.animatables[0]?.masterFrame;
+    if (!cues || !fps || frame === undefined) return;
+    const t = (frame - anim.from) / fps;
+    let prev = this._danceCueT ?? -1;
+    if (t < prev) {
+      prev = -1; // looped: replay from the top, cues at 0 included
+      this._danceHoldUntil = 0;
+    }
+    this._danceCueT = t;
+    const crossed = (times) => times.findIndex((c) => c > prev && c <= t);
+
+    const k = crossed(cues.keyposes);
+    if (k >= 0) {
+      this.expressionManager.setExpression(DANCE_KEYPOSE_FACES[k % DANCE_KEYPOSE_FACES.length]);
+      this._danceHoldUntil = t + 0.45;
+      return;
+    }
+    const b = crossed(cues.beats);
+    if (b >= 0 && t >= (this._danceHoldUntil ?? 0)) {
+      this.expressionManager.setExpression(DANCE_BEAT_FACES[b % DANCE_BEAT_FACES.length]);
+    }
+  }
+
+  /** The face a pass through `cues` ends on (same rules as _tickDanceCues). */
+  _danceEndFace(cues) {
+    const events = [
+      ...cues.keyposes.map((t, i) => ({ t, face: DANCE_KEYPOSE_FACES[i % DANCE_KEYPOSE_FACES.length], hold: true })),
+      ...cues.beats.map((t, i) => ({ t, face: DANCE_BEAT_FACES[i % DANCE_BEAT_FACES.length] })),
+    ].sort((a, b) => a.t - b.t || (b.hold ? 1 : 0) - (a.hold ? 1 : 0));
+    let face = null;
+    let holdUntil = 0;
+    for (const e of events) {
+      if (e.hold) {
+        face = e.face;
+        holdUntil = e.t + 0.45;
+      } else if (e.t >= holdUntil) {
+        face = e.face;
+      }
+    }
+    return face;
+  }
+
+  /**
+   * Start dancing `clip` in place (from idle or walking), or stop if dancing.
+   * Starts on the face the clip ends on, so a looping clip loops seamlessly.
+   */
+  toggleDance(clip = "dance") {
+    if (this.isDancing) {
+      this._exitToIdle();
+      return;
+    }
+    if (!this.ANIM_MAP[clip]) {
+      console.warn(`[Dave] toggleDance: no "${clip}" animation in the model`);
+      return;
+    }
+    if (this.state !== S.IDLE && this.state !== S.WALKING) return;
+    this._exitToIdle();
+    this.wanderTimer = Infinity; // hold the dance until toggled off
+    this.lastAction = "dancing";
+    this.animationController.playForward(clip, true);
+    this._danceCueT = -1;
+    this._danceHoldUntil = 0;
+    const cues = this.danceCues?.[clip];
+    const face = cues && this._danceEndFace(cues);
+    if (face) this.expressionManager.setExpression(face);
   }
 
   /**
@@ -1407,8 +1589,15 @@ export class Dave {
       return true;
     }
 
+    // Tipsy: weave either side of the line he means to walk.
+    const buzz = this.buzz;
+    const sway = buzz >= 2 ? Math.sin(performance.now() / 450) * 0.22 * (buzz - 1) : 0;
     const moveDir = dir.normalize().scale(this.gait.bodySpeed());
-    this.rotateToward(this.getForwardAngle(navTarget), dt);
+    if (sway) {
+      const c = Math.cos(sway), s = Math.sin(sway);
+      moveDir.copyFromFloats(moveDir.x * c + moveDir.z * s, 0, moveDir.z * c - moveDir.x * s);
+    }
+    this.rotateToward(this.getForwardAngle(navTarget) + sway, dt);
     const currentVel = this.davePhysics.body.getLinearVelocity();
     this.davePhysics.body.setLinearVelocity(
       new BABYLON.Vector3(moveDir.x, currentVel.y, moveDir.z),
@@ -1673,6 +1862,7 @@ export class Dave {
         };
 
         await this.animationController.playAsync("chug", false, 1, forwardCbs);
+        this.beerTimes.push(Date.now());
         this.beer.zeroPhysicsVelocity();
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
@@ -1938,7 +2128,7 @@ export class Dave {
 
   // ── Idle Expression Variation ────────────────────────────────────────────
   _tickIdleExpression(dt) {
-    if (this.isMusing || this.isBrowsing) return;
+    if (this.isMusing || this.isBrowsing || this.isDancing) return;
     if (
       this.state !== S.IDLE &&
       this.state !== S.WALKING &&
@@ -2096,11 +2286,18 @@ export class Dave {
     this.updateTurnToCamera(dt);
     this.gait.update(
       dt,
-      this.state !== S.INTERACTING && this.state !== S.GETTING_UP,
+      this.state !== S.INTERACTING &&
+        this.state !== S.GETTING_UP &&
+        !this.isDancing,
       this.state === S.WALKING || this.state === S.WALKING_TO_APPROACH,
     );
 
-    // Gaze and head tracking
+    // Gaze and head tracking. While dancing the head is aimed first, so the
+    // eyes then settle relative to where the head actually ends up.
+    if (this.isDancing) {
+      this._aimHeadAt(this.danceLookTarget ?? this.camera.position);
+      this._tickDanceCues();
+    }
     this.updateEyeLookAt(dt);
     this.updateHeadLookAt(dt);
     this.updateEyeCamera();

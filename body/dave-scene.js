@@ -169,6 +169,22 @@ window.addEventListener("keydown", (event) => {
   }
 });
 
+// Keyboard shortcut: Press 'D' to toggle Dave's dance
+window.addEventListener("keydown", (event) => {
+  if (
+    event.key.toLowerCase() === "d" &&
+    !event.ctrlKey &&
+    !event.altKey &&
+    !event.shiftKey &&
+    !event.metaKey
+  ) {
+    // Make sure we're not typing in an input field
+    if (document.activeElement.tagName !== "INPUT") {
+      window._dave?.toggleDance();
+    }
+  }
+});
+
 const havokInstance = await HavokPhysics();
 const hk = new BABYLON.HavokPlugin(true, havokInstance);
 scene.enablePhysics(new BABYLON.Vector3(0, cfg.MODEL.GRAVITY_Y, 0), hk);
@@ -494,8 +510,10 @@ function getMeshCenter(keyword) {
   return bounds.centerWorld.clone();
 }
 
-// Warm lamp lights
+// Warm lamp lights. Kept, with where each stands, so a tap can switch one.
 const lampKeywords = ["lamp.couch", "lamp.bed", "floorlamp"];
+const LAMP_PLACES = { "lamp.couch": "couch", "lamp.bed": "bed", floorlamp: "desk" };
+const lamps = [];
 lampKeywords.forEach((kw, i) => {
   const lampMesh = enclosureImported.meshes.find((m) =>
     m.name.toLowerCase().includes(kw.toLowerCase()),
@@ -504,7 +522,10 @@ lampKeywords.forEach((kw, i) => {
   const pos = getMeshCenter(kw);
   if (!pos) return;
   pos.y += cfg.ENVIRONMENT.LAMP_HEIGHT_OFFSET;
-  new Lamp(scene, cfg, lampMesh, pos, `lamp_${i}`);
+  const lamp = new Lamp(scene, cfg, lampMesh, pos, `lamp_${i}`);
+  lamp.key = kw;
+  lamp.place = LAMP_PLACES[kw];
+  lamps.push(lamp);
 });
 
 // Overhead ambient light
@@ -647,7 +668,8 @@ if (chairDescriptor) {
   registerInteractable(chairDescriptor);
   const computerMesh = findEnclosureMesh("computer");
   const deskMesh = findEnclosureMesh("desk");
-  [computerMesh, deskMesh].forEach((m) => {
+  const screenMesh = findEnclosureMesh("computerscreen");
+  [computerMesh, deskMesh, screenMesh].forEach((m) => {
     if (m) {
       interactables.set(m, chairDescriptor);
       m.getChildMeshes().forEach((child) =>
@@ -656,7 +678,22 @@ if (chairDescriptor) {
     }
   });
 }
-if (couchDescriptor) registerInteractable(couchDescriptor);
+if (couchDescriptor) {
+  registerInteractable(couchDescriptor);
+  // Every part of the couch (frame and cushions load as separate primitives,
+  // and findEnclosureMesh only returns the first) plus the TV corner around it.
+  ["couch", "coffeetable", "tv", "tvtable"].forEach(
+    (name) => {
+      // Multi-material pieces load as name_primitiveN under a plain node.
+      enclosureImported.meshes
+        .filter((x) => x.name === name || x.parent?.name === name)
+        .forEach((x) => {
+          interactables.set(x, couchDescriptor);
+          x.isPickable = true;
+        });
+    },
+  );
+}
 
 // Register bed as interactable (laydown animation)
 const bedMesh = findEnclosureMesh("bed");
@@ -771,6 +808,7 @@ const furnitureByName = {};
 if (chairDescriptor) furnitureByName["chair"] = chairDescriptor;
 if (chairDescriptor) furnitureByName["computer"] = chairDescriptor;
 if (couchDescriptor) furnitureByName["couch"] = couchDescriptor;
+if (couchDescriptor) furnitureByName["tv"] = couchDescriptor;
 if (bedDescriptor) furnitureByName["bed"] = bedDescriptor;
 if (kegDescriptor) furnitureByName["keg"] = kegDescriptor;
 if (kegDescriptor) furnitureByName["kegerator"] = kegDescriptor;
@@ -1172,15 +1210,19 @@ async function fetchAndReadArticle(scheduler, { title } = {}) {
 // based on his mood + hour + history. Runs ~3-5 hops per session, with
 // reading pauses in between. Stops cleanly if the activity is interrupted
 // or Dave declines to keep clicking.
-async function runBrowseSession(scheduler) {
+// A topic a visitor asked him to look up: his next session at the computer
+// opens on it instead of a random article.
+let nextLookUp = null;
+
+async function runBrowseSession(scheduler, seedTitle = null) {
   if (scheduler?.aborted) return;
 
   const MAX_HOPS = 4 + Math.floor(Math.random() * 2); // 4-5 link follows
   const history = [];
   let currentLinks = [];
 
-  // Hop 0: seed with a random article.
-  const seed = await fetchAndReadArticle(scheduler, {});
+  // Hop 0: seed with the requested topic, or a random article.
+  const seed = await fetchAndReadArticle(scheduler, seedTitle ? { title: seedTitle } : {});
   if (!seed || scheduler.aborted) return;
   if (seed.articleTitle) history.push(seed.articleTitle);
   currentLinks = seed.links || [];
@@ -1421,6 +1463,18 @@ const dave = new Dave(
 // Store dave reference for keyboard handlers (e.g., grid visualization)
 window._dave = dave;
 
+// Every request tells the mind how many beers he's had lately.
+mindClient.extraBody = () => (dave.buzz ? { buzz: dave.buzz } : {});
+
+// Beat / key-pose times for each dance clip's expression changes (tinydancer)
+dave.danceCues = {};
+for (const clip of ["dance", "dance_loop"]) {
+  fetch(`/assets/${clip}_cues.json`)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((cues) => cues && (dave.danceCues[clip] = cues))
+    .catch(() => {});
+}
+
 // ── Mutter Callback ───────────────────────────────────────────────────────
 // Dave fires passive speech (linger notices, directive grumbles) through here.
 dave.onMutter = async (text) => {
@@ -1462,7 +1516,8 @@ if (chairDescriptor) {
     // which outbound link to follow (mood+hour aware) → load it → repeat
     // for ~4-5 hops. Fire-and-forget; the session checks scheduler.aborted
     // after every await so leaving the chair stops it cleanly.
-    runBrowseSession(scheduler);
+    runBrowseSession(scheduler, nextLookUp);
+    nextLookUp = null;
   };
   chairDescriptor.onExit = function (dave, _scheduler) {
     dave.isBrowsing = false;
@@ -1529,33 +1584,66 @@ pipBox.addEventListener("click", () => {
 
 // `msg` is the history entry for this line (from addMessageToHistory with
 // reveal), whose bubble fills in word by word as Dave says each one.
+// One line at a time: a new line cuts off the one still being spoken, which
+// stays in the history up to where he got, ending in "--".
+let currentSpeech = null;
+
 function speak(text, rate, msg = null) {
+  currentSpeech?.interrupt();
   return new Promise((resolve) => {
+    const timers = [];
+    let paceTimer = null;
+    let over = false;
+    const finish = () => {
+      if (over) return false;
+      over = true;
+      timers.forEach(clearTimeout);
+      clearInterval(paceTimer);
+      dave.expressionManager.stopLipSync();
+      if (currentSpeech === speech) currentSpeech = null;
+      resolve();
+      return true;
+    };
+    const speech = {
+      interrupt() {
+        if (!finish()) return;
+        if (usingVoice) speechSynthesis.cancel();
+        cutOff(msg);
+      },
+    };
+    currentSpeech = speech;
+
     // Timed reveal without audio, for muted Dave or when speech never starts.
+    let usingVoice = false;
     const revealOnTimer = () => {
+      usingVoice = false;
       dave.expressionManager.startLipSync(text);
       const durationMs = (text.length * 60) / rate;
       const msPerChar = durationMs / Math.max(text.length, 1);
       for (let i = 0; i < text.length; i++) {
-        setTimeout(() => {
-          dave.expressionManager.speechCharIndex = i;
-          revealWordAt(msg, i);
-        }, i * msPerChar);
+        timers.push(
+          setTimeout(() => {
+            dave.expressionManager.speechCharIndex = i;
+            revealWordAt(msg, i);
+          }, i * msPerChar),
+        );
       }
-      setTimeout(() => {
-        dave.expressionManager.stopLipSync();
-        finishReveal(msg);
-        resolve();
-      }, durationMs);
+      timers.push(
+        setTimeout(() => {
+          if (finish()) finishReveal(msg);
+        }, durationMs),
+      );
     };
     if (isMuted || !("speechSynthesis" in window)) {
       revealOnTimer();
       return;
     }
 
+    usingVoice = true;
     const utt = new SpeechSynthesisUtterance(text);
-    utt.rate = rate;
-    utt.pitch = 0.75;
+    // A few beers in, he talks slower and lower.
+    utt.rate = rate * (1 - 0.08 * dave.buzz);
+    utt.pitch = 0.75 - 0.05 * dave.buzz;
 
     const voices = speechSynthesis.getVoices();
     const preferred = voices.find(
@@ -1571,7 +1659,6 @@ function speak(text, rate, msg = null) {
     // Some voices (Chrome's network voices among them) never fire
     // onboundary. Until the first boundary arrives, pace the reveal at the
     // muted path's estimate so the bubble doesn't sit empty the whole line.
-    let paceTimer = null;
     const stopPacing = () => {
       clearInterval(paceTimer);
       paceTimer = null;
@@ -1579,14 +1666,17 @@ function speak(text, rate, msg = null) {
     // iOS Safari silently drops speech it doesn't consider user-initiated:
     // no onstart, onend or onerror ever fires. Fall back to the timed reveal.
     let abandoned = false;
-    const startWatchdog = setTimeout(() => {
-      abandoned = true;
-      speechSynthesis.cancel();
-      revealOnTimer();
-    }, 2500);
+    timers.push(
+      setTimeout(() => {
+        abandoned = true;
+        speechSynthesis.cancel();
+        revealOnTimer();
+      }, 2500),
+    );
+    const startWatchdog = timers[timers.length - 1];
     utt.onstart = () => {
       clearTimeout(startWatchdog);
-      if (abandoned) return;
+      if (abandoned || over) return;
       dave.expressionManager.startLipSync(text);
       if (!msg) return;
       const started = performance.now();
@@ -1597,7 +1687,7 @@ function speak(text, rate, msg = null) {
       }, 50);
     };
     utt.onboundary = (e) => {
-      if (abandoned) return;
+      if (abandoned || over) return;
       dave.expressionManager.speechCharIndex = e.charIndex;
       if (e.name && e.name !== "word") return;
       stopPacing();
@@ -1606,19 +1696,14 @@ function speak(text, rate, msg = null) {
     utt.onend = () => {
       clearTimeout(startWatchdog);
       if (abandoned) return;
-      stopPacing();
-      dave.expressionManager.stopLipSync();
-      finishReveal(msg);
-      resolve();
+      if (finish()) finishReveal(msg);
     };
     utt.onerror = (err) => {
       clearTimeout(startWatchdog);
-      if (abandoned) return;
-      stopPacing();
+      // A cut-off line errors with "interrupted"; that's not a failure.
+      if (abandoned || over) return;
       handleError("speak", err);
-      dave.expressionManager.stopLipSync();
-      finishReveal(msg);
-      resolve();
+      if (finish()) finishReveal(msg);
     };
     speechSynthesis.speak(utt);
   });
@@ -1694,24 +1779,20 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     dave.onUserDepart();
   } else {
-    // Capture neglect phase before onUserArrive clears _tabHiddenAt
-    const neglectPhase = dave._getNeglectPhase();
+    // Read how long they were gone before onUserArrive clears _tabHiddenAt
+    const awayMin = dave._tabHiddenAt
+      ? Math.round((Date.now() - dave._tabHiddenAt) / 60000)
+      : 0;
     dave.onUserArrive();
     userLingerTimer = 45 + Math.random() * 30;
-    if (neglectPhase >= 1) {
-      const ctxStr =
-        neglectPhase >= 2
-          ? "The user has been gone for a very long time. React to their return with deep weariness."
-          : "The user just came back after being away for a while. React to their return.";
+    if (awayMin >= GREET_AFTER_AWAY_MIN) {
       setTimeout(() => {
-        if (!isBusy && !dave.isMusing) {
-          dave.triggerMuse(ctxStr).then((r) => {
-            if (r?.text) {
-              const spokenMsg = addMessageToHistory("dave", r.text, { reveal: true });
-              speak(r.text, 1.0, spokenMsg);
-            }
-          });
-        }
+        if (isBusy || dave.isMusing) return;
+        lastSpokeFirstAt = Date.now();
+        mindClient
+          .greet(awayMin)
+          .then(sayToVisitor)
+          .catch((err) => handleError("greet", err));
       }, 2000);
     }
   }
@@ -1735,6 +1816,20 @@ scene.onBeforeRenderObservable.add(() => {
     }
   }
 
+  // His eyes follow the cursor while it moves, at his distance from the camera
+  if (performance.now() - cursorMovedAt < CURSOR_GAZE_MS) {
+    const ray = scene.createPickingRay(
+      scene.pointerX,
+      scene.pointerY,
+      BABYLON.Matrix.Identity(),
+      camera,
+    );
+    const dist = BABYLON.Vector3.Distance(camera.position, daveCapsule.position);
+    dave.cursorTarget = ray.origin.add(ray.direction.scale(dist));
+  } else {
+    dave.cursorTarget = null;
+  }
+
   // Update Dave character (animations, expressions, movement, gaze, etc.).
   // Wrapped in try/catch so a Dave tick throw can't take CAM's blink and
   // the camera follow logic offline alongside it.
@@ -1751,8 +1846,8 @@ scene.onBeforeRenderObservable.add(() => {
     (daveCapsule.position.z - cameraTarget.z) * cfg.CAMERA.FOLLOW_SPEED;
   cameraTarget.y = cfg.CAMERA.TARGET_Y;
 
-  // Position cam character at the orbital camera
-  if (camCharacter.root) {
+  // Position cam character at the orbital camera (unless film mode has cast it)
+  if (camCharacter.root && !filmShot?.camChar) {
     camCharacter.root.position.copyFrom(camera.position);
     // Face toward cameraTarget (same direction the orbital camera looks)
     const camDir = cameraTarget.subtract(camera.position);
@@ -1762,7 +1857,11 @@ scene.onBeforeRenderObservable.add(() => {
     }
   }
   try {
-    camCharacter.update(dt, cameraTarget, camera.position);
+    camCharacter.update(
+      dt,
+      filmShot?.camChar?.lookAt ?? cameraTarget,
+      filmShot?.camChar ? camCharacter.root.position : camera.position,
+    );
   } catch (e) {
     handleError("camCharacter.update", e);
   }
@@ -1903,6 +2002,25 @@ function revealWordAt(msg, charIndex) {
   setRevealed(msg, end === -1 ? msg.text.length : charIndex + end);
 }
 
+// Stop a line where he got to and mark it cut off. A line cut before its
+// first word leaves nothing behind.
+function cutOff(msg) {
+  if (!msg || !revealing.has(msg)) return;
+  const said = msg.text.slice(0, revealing.get(msg)).trimEnd();
+  revealing.delete(msg);
+  if (said) {
+    msg.text = said + "--";
+  } else {
+    sessionMessages.splice(sessionMessages.indexOf(msg), 1);
+  }
+  try {
+    localStorage.setItem(`dave-session-${SESSION_ID}`, JSON.stringify(sessionMessages));
+  } catch (e) {
+    handleError("history", e);
+  }
+  renderSessionHistory();
+}
+
 function finishReveal(msg) {
   if (!msg || !revealing.has(msg)) return;
   setRevealed(msg, msg.text.length);
@@ -2040,8 +2158,8 @@ function makePassiveSeat(template, { onEnter, onExit } = {}) {
   return passive;
 }
 
-async function submitUrl(url) {
-  addMessageToHistory("user", url);
+async function submitUrl(url, { echo = true } = {}) {
+  if (echo) addMessageToHistory("user", url);
   isBusy = true;
   sendBtn.disabled = true;
   chatInput.disabled = true;
@@ -2188,6 +2306,8 @@ async function sendMessage() {
 
   // Add user message to history immediately
   addMessageToHistory("user", text);
+  unansweredQuestions = 0;
+  let urlToOpen = null;
 
   isBusy = true;
   sendBtn.disabled = true;
@@ -2227,15 +2347,30 @@ async function sendMessage() {
     const spokenMsg = addMessageToHistory("dave", r.text, { reveal: true });
     await speak(r.text, r.speechRate || 0.85, spokenMsg);
 
-    // If the LLM directed Dave to move to furniture, go immediately
-    if (r.moveTo && furnitureByName[r.moveTo]) {
+    // Something to look up: a topic opens his next computer session, a URL
+    // goes the way a pasted link does (once this chat lets go of isBusy).
+    const lookUp = (r.lookUp || "").trim();
+    if (/^https?:\/\//i.test(lookUp)) urlToOpen = lookUp;
+    else if (lookUp && chairDescriptor) nextLookUp = lookUp;
+
+    // If the LLM directed Dave to go somewhere or do something, do it now
+    const target =
+      (nextLookUp && chairDescriptor) || (r.moveTo && furnitureByName[r.moveTo]);
+    if (target || r.action || urlToOpen) {
       dave._lockExpression(500);
+      // He's been asked to do this instead of whatever the chat interrupted;
+      // resuming that first would leave the new activity queued and dropped.
+      dave._returnAction = null;
       dave.exitTalkingState();
-      dave.startInteraction(furnitureByName[r.moveTo], Infinity);
+      if (target) dave.startInteraction(target, Infinity);
+      else if (r.action === "dance") danceForAWhile();
+      else if (r.action === "wander") dave.walkSomewhere();
+      dave._applyGazeTarget(r.gaze);
     } else {
       setTimeout(() => {
         dave._lockExpression(500);
         dave.exitTalkingState();
+        dave._applyGazeTarget(r.gaze);
       }, 3000);
     }
   } catch (err) {
@@ -2249,6 +2384,18 @@ async function sendMessage() {
     chatInput.disabled = false;
     chatInput.focus();
   }
+  if (urlToOpen) submitUrl(urlToOpen, { echo: false });
+}
+
+// A dance asked for in chat stops on its own; the D key's dance doesn't.
+const CHAT_DANCE_SEC = 45;
+let chatDanceTimer = null;
+function danceForAWhile() {
+  dave.toggleDance();
+  clearTimeout(chatDanceTimer);
+  chatDanceTimer = setTimeout(() => {
+    if (dave.isDancing) dave.toggleDance();
+  }, CHAT_DANCE_SEC * 1000);
 }
 
 sendBtn.addEventListener("click", sendMessage);
@@ -2320,10 +2467,29 @@ if ("speechSynthesis" in window) {
 
 // ── Click / Tap on Interactable Objects ────────────────────────────────
 
-scene.onPointerDown = (_evt, pickResult) => {
-  if (!pickResult.hit || !pickResult.pickedMesh) return;
+// On tap, not press: a press that turns into a drag is orbiting the camera.
+scene.onPointerObservable.add(({ type, pickInfo: pickResult }) => {
+  if (type !== BABYLON.PointerEventTypes.POINTERTAP) return;
+  if (!pickResult?.hit || !pickResult.pickedMesh) return;
+
+  const lamp = lampOf(pickResult.pickedMesh);
+  if (lamp) {
+    toggleLamp(lamp);
+    return;
+  }
+
   if (isBusy || dave.state === S.TALKING || dave.state === S.TURNING_TO_CAMERA)
     return;
+
+  // Tapping the TV while he's watching it changes the channel.
+  if (
+    dave.isWatchingTv &&
+    dave.state === S.INTERACTING &&
+    isTvMesh(pickResult.pickedMesh)
+  ) {
+    changeChannel();
+    return;
+  }
 
   // Walk up the parent chain to find a registered interactable
   let mesh = pickResult.pickedMesh;
@@ -2336,7 +2502,131 @@ scene.onPointerDown = (_evt, pickResult) => {
   if (!descriptor) return;
 
   dave.startInteraction(descriptor, Infinity); // no auto-timeout when user-initiated
-};
+});
+
+// ── Lamps and the TV ────────────────────────────────────────────────────
+// A tapped lamp switches on or off, and Dave remarks on it (not on every
+// flick of the switch). A tap on the TV while he watches changes the channel.
+
+const LAMP_REMARK_GAP_MS = 20000;
+let lampRemarkAt = 0;
+
+function lampOf(mesh) {
+  for (; mesh; mesh = mesh.parent) {
+    const lamp = lamps.find(
+      (l) => mesh.name === l.key || mesh.name.startsWith(l.key + "_"),
+    );
+    if (lamp) return lamp;
+  }
+  return null;
+}
+
+// Off is zero intensity, not setEnabled(false): a disabled light changes which
+// lights the materials count (they take the first four of five), recompiling
+// every shader and pulling the overhead light in mid-frame.
+const lampIsOn = (l) => l.light.intensity > 0;
+
+function toggleLamp(lamp) {
+  const on = !lampIsOn(lamp);
+  lamp.light.intensity = on ? cfg.ENVIRONMENT.LAMP_INTENSITY : 0;
+  if (isBusy || dave.isMusing || Date.now() - lampRemarkAt < LAMP_REMARK_GAP_MS)
+    return;
+  lampRemarkAt = Date.now();
+  const allOff = lamps.every((l) => !lampIsOn(l));
+  const situation =
+    `Someone just switched ${on ? "on" : "off"} the lamp by the ${lamp.place}.` +
+    (allOff ? " Every lamp is off now." : "");
+  dave.triggerMuse(situation).then((r) => {
+    if (r?.text) {
+      const spokenMsg = addMessageToHistory("dave", r.text, { reveal: true });
+      speak(r.text, 1.0, spokenMsg);
+    }
+  });
+}
+
+function isTvMesh(mesh) {
+  for (; mesh; mesh = mesh.parent) if (mesh.name === "tv") return true;
+  return false;
+}
+
+let changingChannel = false;
+function changeChannel() {
+  if (changingChannel) return;
+  changingChannel = true;
+  dave.expressionManager.setExpression("weary-contempt");
+  dave._lockExpression(2000);
+  doWatchTv(dave._activitySession?.scheduler).finally(() => {
+    changingChannel = false;
+  });
+}
+
+// ── Dave speaks first ───────────────────────────────────────────────────
+// He greets a visitor he's talked with before when the page opens, and
+// anyone back on the tab after a while; and when someone has watched in
+// silence for a few minutes he asks them something. If they ignore two
+// questions in a row he stops asking until they say something.
+
+const GREET_AFTER_AWAY_MIN = 2;
+const ASK_AFTER_QUIET_MS = 3 * 60 * 1000;
+let lastSpokeFirstAt = Date.now();
+let unansweredQuestions = 0;
+
+async function sayToVisitor(r) {
+  if (!r?.text || isBusy) return;
+  dave.expressionManager.setExpression(r.emotion);
+  dave._lockExpression(4000);
+  dave._applyGazeTarget("user");
+  const spokenMsg = addMessageToHistory("dave", r.text, { reveal: true });
+  await speak(r.text, 0.95, spokenMsg);
+}
+
+function whatDaveIsDoing() {
+  if (dave.isDancing) return "dancing";
+  return (
+    {
+      couch: "sitting on the couch watching TV",
+      chair: "at the computer reading Wikipedia",
+      bed: "lying on the bed",
+      keg: "at the kegerator having a beer",
+    }[dave.currentInteraction?.label] || "standing around your room"
+  );
+}
+
+setInterval(async () => {
+  if (document.hidden || !dave.userPresent || isBusy || dave.isMusing) return;
+  if (unansweredQuestions >= 2) return;
+  if (Date.now() - Math.max(dave.lastChatTime, lastSpokeFirstAt) < ASK_AFTER_QUIET_MS)
+    return;
+  if (dave.state === S.TALKING || dave.state === S.TURNING_TO_CAMERA) return;
+  lastSpokeFirstAt = Date.now();
+  unansweredQuestions++;
+  try {
+    await sayToVisitor(await mindClient.initiate(whatDaveIsDoing()));
+  } catch (err) {
+    handleError("initiate", err);
+  }
+}, 15000);
+
+if (STORED_USER_ID) {
+  setTimeout(async () => {
+    if (isBusy) return;
+    lastSpokeFirstAt = Date.now();
+    try {
+      await sayToVisitor(await mindClient.greet());
+    } catch (err) {
+      handleError("greet", err);
+    }
+  }, 4000);
+}
+
+// ── Cursor ───────────────────────────────────────────────────────────────
+// Dave watches the cursor while it moves (see the render loop).
+const CURSOR_GAZE_MS = 2500;
+let cursorMovedAt = 0;
+scene.onPointerObservable.add(({ type }) => {
+  if (type === BABYLON.PointerEventTypes.POINTERMOVE) cursorMovedAt = performance.now();
+});
+canvas.addEventListener("pointerleave", () => (cursorMovedAt = 0));
 
 // ── Tap-to-Interact System (Token Conservation) ──────────────────────────
 // Click on Dave to trigger AI requests based on context
@@ -2409,4 +2699,539 @@ document.addEventListener("click", (event) => {
   }
   if (!onDave) return;
   handleDaveTap();
+});
+
+// ── Film Mode ────────────────────────────────────────────────────────────
+// Two shoots, each recorded from a fixed camera just above Dave's head height
+// to a 9:16 file (canvas + the dance's original audio) that downloads when done:
+//   'C' / 'F'              — the LOOP: Dave dances the seamless dance_loop on a
+//                            mark beside the coffee table, TV and couch behind.
+//                            'C' previews the shot (frozen on frame 0, 'C' again
+//                            to leave), 'F' films one pass.
+//   Shift+'C' / Shift+'F'  — the STORY: a wider shot. Dave starts on the couch
+//                            watching TV, gets up and walks to his mark while the
+//                            source clip's lead-in audio plays, then dances the
+//                            full clip from the moment the dancer did.
+// The TV plays its usual random video. Clips, cues and audio come from tinydancer.
+const FILM = {
+  WIDTH: 1080, // 9:16 portrait for Instagram Reels
+  HEIGHT: 1920,
+  FOV: 0.82, // vertical, radians (the source phone's ≈47°)
+  CAM_YAW_DEG: 30, // camera swings this far from square-on toward the couch
+  CAM_ABOVE_HEAD: 1.2, // camera height over the top of Dave's head
+  LOOP: {
+    CLIP: "dance_loop", // the seamless loop, so the Reel loops cleanly
+    AUDIO_URL: "/assets/film/dance_loop_audio.m4a",
+    MARK_ACROSS: 3.5, // Dave's mark: this far from the coffee table, room side...
+    MARK_TOWARD_COUCH: 1.9, // ...and this far along it toward the couch
+    FRAME_MARGIN: 1.3, // breathing room around his body (and dance travel)
+  },
+  STORY: {
+    CLIP: "dance",
+    AUDIO_URL: "/assets/film/dance_story_audio.m4a", // source clip from its start
+    // The TV plays the source clip itself (silent), locked to the audio, so
+    // Dave dances along with the dancer on screen
+    TV_URL: "/assets/film/dance_story_tv.mp4",
+    TV_SYNC_TOLERANCE: 0.04, // s of drift from the audio before it's corrected
+    DANCE_AT: 5.0, // seconds into that audio the dancer starts
+    GET_UP_AT: 0.8, // seconds of watching TV before he gets up (up + walk ≈ 3.1s)
+    MARK_ALONG: 4.0, // his mark: from the middle of the couch, along toward the room...
+    MARK_OUT: 0.6, // ...this far out in front of it...
+    MARK_TOWARD_CAM: 0.6, // ...and this much toward the camera — clear of the
+    // couch even at his widest moves (he reaches ~1.6 to his left, big head)
+    TARGET_Y: 2.0, // camera aims at the mark, so he's centred as he dances
+    CAM_DIST: 17, // pulled back so the couch, the walk and the TV fit around him
+    // The little camera character, cast as an over-eager camera operator
+    CAMCHAR: {
+      LEAD: 2.8, // before the dance: this far from Dave toward the TV...
+      OFFSET: -1.5, // ...off to the far side, so its lens and logo face our camera
+      LEAD_HEIGHT: 2.8,
+      BLEND: 1.2, // seconds to swoop from there into the dance arc
+      RADIUS: 3.2, // dance arc: from Dave
+      HEIGHT: 3.0,
+      SWEEP_DEG: 70, // swings this far either side of its start while he dances...
+      SWEEP_PERIOD: 4.2, // ...this slowly (s), passing behind him, never in front
+      DIP: 0.9, // swoops down this far for hero angles
+      BOB: 0.18, // and bounces this much on every beat of the music
+    },
+    // He walks over (~4.5 units) more eagerly than his usual reluctant lurch,
+    // in big strides, to make his mark, turn to camera and hold a beat before
+    // the dance starts
+    GAIT: { hesitation: 0, holdTime: 0.04, stride: 1.1 },
+    DANCE_BLEND: 0.035, // ease from his standing pose into the dance (~0.5s)
+  },
+};
+let filmShot = null; // { cam, prevCameras, ... } while the film camera is up
+let filming = false;
+
+function _filmMimeType() {
+  return (
+    ["video/mp4;codecs=avc1,mp4a.40.2", "video/mp4", "video/webm;codecs=vp9,opus", "video/webm"]
+      .find((t) => MediaRecorder.isTypeSupported(t)) || ""
+  );
+}
+
+// Room axes from the furniture: u runs TV → couch, n across it toward the room.
+function _filmAxes() {
+  const center = (m) => m.getBoundingInfo().boundingBox.centerWorld;
+  const flat = (v) => new BABYLON.Vector3(v.x, 0, v.z);
+  const table = flat(center(findEnclosureMesh("coffeetable")));
+  const u = flat(center(couchMesh).subtract(center(tvMesh))).normalize();
+  let n = new BABYLON.Vector3(-u.z, 0, u.x);
+  if (BABYLON.Vector3.Dot(n, table.scale(-1)) < 0) n = n.scale(-1);
+  const yaw = BABYLON.Tools.ToRadians(FILM.CAM_YAW_DEG);
+  const toCam = n.scale(Math.cos(yaw)).add(u.scale(Math.sin(yaw)));
+  return { table, u, n, toCam };
+}
+
+function _daveHeight() {
+  return root.getHierarchyBoundingVectors(true).max.y - root.getAbsolutePosition().y;
+}
+
+// Loop shot: Dave's mark beside the table, camera framing just him.
+function _loopLayout(daveHeight) {
+  const { table, u, n, toCam } = _filmAxes();
+  const L = FILM.LOOP;
+  const mark = table.add(n.scale(L.MARK_ACROSS)).add(u.scale(L.MARK_TOWARD_COUCH));
+  const dist = ((daveHeight / 2) * L.FRAME_MARGIN) / Math.tan(FILM.FOV / 2);
+  const target = mark.add(new BABYLON.Vector3(0, daveHeight / 2, 0));
+  const camPos = mark
+    .add(toCam.scale(dist))
+    .add(new BABYLON.Vector3(0, daveHeight + FILM.CAM_ABOVE_HEAD, 0));
+  return { mark, target, camPos };
+}
+
+// Story shot: a seat on the couch, a mark near it, and a wider camera.
+function _storyLayout(daveHeight) {
+  const { u, n, toCam } = _filmAxes();
+  const ST = FILM.STORY;
+  const seat = couchDescriptor.approachPos.clone(); // the middle of the couch
+  const mark = seat
+    .add(n.scale(ST.MARK_ALONG))
+    .add(u.scale(-ST.MARK_OUT))
+    .add(toCam.scale(ST.MARK_TOWARD_CAM));
+  const target = mark.add(new BABYLON.Vector3(0, ST.TARGET_Y, 0));
+  const camPos = new BABYLON.Vector3(target.x, 0, target.z)
+    .add(toCam.scale(ST.CAM_DIST))
+    .add(new BABYLON.Vector3(0, daveHeight + FILM.CAM_ABOVE_HEAD, 0));
+  return { seat, mark, target, camPos, n };
+}
+
+// The camera character "filming" Dave: hovers between him and the TV (off to
+// the far side, angled toward the real camera) while he watches and walks over, then once he dances
+// (`danceT` seconds in) swoops into an arc around behind him and back,
+// dipping, bobbing on the beat and rolling for drama — on the far side of him
+// from the real camera, so it never blocks the shot. Lens always on Dave.
+function _driveCamChar(danceT) {
+  const C = FILM.STORY.CAMCHAR;
+  const node = camCharacter.root;
+  if (!node || !filmShot?.story) return;
+  const center = new BABYLON.Vector3(daveCapsule.position.x, 0, daveCapsule.position.z);
+  const toFilm = filmShot.cam.position.subtract(center);
+  toFilm.y = 0;
+  toFilm.normalize();
+  // Which way round puts it on the room side to begin with
+  const side = -Math.sign(BABYLON.Vector3.Cross(toFilm, filmShot.story.n).y) || 1;
+  const tau = 2 * Math.PI;
+  const d = Math.max(0, danceT ?? 0);
+  // 0° = between Dave and the real camera; 180 ± SWEEP stays behind him
+  const theta = BABYLON.Tools.ToRadians(180 - C.SWEEP_DEG * Math.cos((tau * d) / C.SWEEP_PERIOD));
+  const r = C.RADIUS - 0.5 * (1 - Math.cos((tau * d) / 2.9));
+  // Bounce on the beat: the music's own clock, on the dance clip's beat grid
+  // (cue times count from the dance start, DANCE_AT into the audio).
+  const t = filmShot.audio?.currentTime ?? performance.now() / 1000;
+  const beats = dave.danceCues?.[FILM.STORY.CLIP]?.beats ?? [0, 60 / 76];
+  const period = (beats[beats.length - 1] - beats[0]) / (beats.length - 1);
+  const phase = (t - FILM.STORY.DANCE_AT - beats[0]) / period;
+  const bounce = -C.BOB * (1 - Math.abs(Math.sin(Math.PI * phase))); // lowest on each beat
+  const y =
+    C.HEIGHT -
+    C.DIP * (danceT == null ? 0 : 0.5 * (1 - Math.cos((tau * d) / 3.3))) +
+    bounce;
+  const a = side * theta;
+  const dir = new BABYLON.Vector3(
+    toFilm.x * Math.cos(a) - toFilm.z * Math.sin(a),
+    0,
+    toFilm.x * Math.sin(a) + toFilm.z * Math.cos(a),
+  );
+  const arc = center.add(dir.scale(r));
+  arc.y = y;
+
+  const tvCenter = tvMesh.getBoundingInfo().boundingBox.centerWorld;
+  const toTv = new BABYLON.Vector3(tvCenter.x - center.x, 0, tvCenter.z - center.z).normalize();
+  const lead = center.add(toTv.scale(C.LEAD)).add(filmShot.story.n.scale(C.OFFSET));
+  lead.y = C.LEAD_HEIGHT + bounce;
+
+  const w = danceT == null ? 0 : Math.min(1, danceT / C.BLEND);
+  node.position.copyFrom(BABYLON.Vector3.Lerp(lead, arc, w * w * (3 - 2 * w)));
+  const lookAt = center.add(new BABYLON.Vector3(0, 3.0, 0));
+  const v = lookAt.subtract(node.position);
+  // Lens toward Dave (same facing convention as the room's own placement)
+  node.rotation.y = Math.atan2(v.x, v.z) + MODEL_FORWARD_OFFSET;
+  node.rotation.x = Math.atan2(v.y, Math.hypot(v.x, v.z)); // tilt down at him
+  node.rotation.z = danceT == null ? 0 : 0.18 * Math.sin((Math.PI * phase) / 2); // dutch roll, every two beats
+  filmShot.camChar = { lookAt };
+}
+
+// TV: a specific clip, cued at its first frame and held there until the take
+// starts it (see filmStory), not looping.
+async function _filmTvClip(url) {
+  applyVideoToTv(url);
+  const video = tvVideoElement;
+  video.loop = false;
+  video.pause();
+  video.currentTime = 0;
+  tvUserMediaActive = true;
+  for (let i = 0; i < 100 && video.readyState < 2; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+// TV: whatever the mind would put on for Dave. The client refuses calls during
+// its rate-limit backoff ("retry in Nms"), which page-load chatter often
+// triggers — wait it out and retry rather than film a dead TV. The video is
+// then held for the take (nothing else may change the TV).
+async function _filmTv() {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const { videoUrl } = await mindClient.watchTv();
+      if (videoUrl) applyVideoToTv(videoUrl);
+      break;
+    } catch (err) {
+      const retryMs = Number(/retry in (\d+)ms/.exec(err.message)?.[1]);
+      if (!retryMs || attempt === 3) {
+        console.warn("[Film] no TV video, filming with static:", err);
+        break;
+      }
+      await new Promise((r) => setTimeout(r, retryMs + 100));
+    }
+  }
+  tvUserMediaActive = true;
+}
+
+function _filmCamera(camPos, target) {
+  const cam = new BABYLON.UniversalCamera("filmCam", camPos, scene);
+  cam.fov = FILM.FOV;
+  cam.minZ = 0.1;
+  cam.setTarget(target);
+  filmShot = { cam, prevCameras: scene.activeCameras.slice() };
+  dave.danceLookTarget = cam.position; // play to the film camera
+  scene.activeCameras = [cam];
+  engine.setSize(FILM.WIDTH, FILM.HEIGHT);
+}
+
+function _placeDave(pos, facingAngle) {
+  dave.scripted = true; // ignore his own idle decisions for the shot
+  if (dave.currentInteraction) dave.leaveInteraction();
+  dave._exitToIdle();
+  dave.wanderTimer = Infinity; // no wandering off mid-take
+  davePhysics.body.disablePreStep = false;
+  davePhysics.body.setLinearVelocity(BABYLON.Vector3.Zero());
+  daveCapsule.position.set(pos.x, DAVE_CAPSULE_HEIGHT / 2, pos.z);
+  dave.root.rotation.y = facingAngle;
+}
+
+// Loop: Dave on his mark facing the camera, frozen on the dance's first frame.
+async function _startLoopShot() {
+  const { mark, target, camPos } = _loopLayout(_daveHeight());
+  _placeDave(mark, dave.getForwardAngle(camPos));
+  dave.toggleDance(FILM.LOOP.CLIP);
+  dave.danceAnim.pause();
+  dave.danceAnim.goToFrame(dave.danceAnim.from);
+  await _filmTv();
+  _filmCamera(camPos, target);
+}
+
+// Story: Dave sat on the couch, eyes on the TV, ready to get up.
+async function _startStoryShot() {
+  const layout = _storyLayout(_daveHeight());
+  _placeDave(layout.seat, couchDescriptor.facingAngle);
+  await (FILM.STORY.TV_URL ? _filmTvClip(FILM.STORY.TV_URL) : _filmTv());
+  const seat = new Activity({
+    label: "couch",
+    mesh: couchDescriptor.mesh,
+    approachPos: layout.seat,
+    departPos: layout.seat,
+    facingAngle: couchDescriptor.facingAngle,
+    anim: couchDescriptor.anim,
+    blocksHead: true,
+    reversible: true,
+    defaultDuration: 600,
+    maxDuration: 600,
+  });
+  // He's already on the seat, facing the TV: sit him directly — what the FSM's
+  // align step does on arrival — rather than via its walk-up, which can stall
+  // against the couch's collider (or start from a mid-activity state) and
+  // leave him standing for the whole take.
+  dave.nextInteractionPending = null;
+  dave.nextStateAfterGetUp = null;
+  dave.currentInteraction = seat;
+  dave.interactionDuration = 600;
+  dave._enterAction(seat.anim);
+  dave.state = S.INTERACTING;
+  dave.gazeOverride = tvMesh.getBoundingInfo().boundingBox.centerWorld.clone();
+  _filmCamera(layout.camPos, layout.target);
+  filmShot.story = layout;
+  filmShot.camCharSaved = {
+    scaling: camCharacter.root.scaling.clone(),
+    rotation: camCharacter.root.rotation.clone(),
+  };
+  filmShot.camCharObserver = scene.onBeforeRenderObservable.add(() =>
+    _driveCamChar(filmShot?.danceStartedAt != null ? performance.now() / 1000 - filmShot.danceStartedAt : null),
+  );
+  // Settle onto the couch before anything rolls (or the preview shows).
+  for (let i = 0; i < 80 && (dave.state !== S.INTERACTING || dave.animationController.currentAnimation?.isPlaying); i++) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+function _endFilmShot() {
+  if (!filmShot) return;
+  if (filmShot.observer) scene.onBeforeRenderObservable.remove(filmShot.observer);
+  if (filmShot.camCharObserver) scene.onBeforeRenderObservable.remove(filmShot.camCharObserver);
+  if (filmShot.camCharSaved) {
+    camCharacter.root.scaling.copyFrom(filmShot.camCharSaved.scaling);
+    camCharacter.root.rotation.copyFrom(filmShot.camCharSaved.rotation);
+  }
+  if (filmShot.blendRestore) {
+    const { clip, on, speed } = filmShot.blendRestore;
+    clip.enableBlending = on;
+    clip.blendingSpeed = speed;
+  }
+  if (filmShot.gait) Object.assign(dave.gait, filmShot.gait);
+  if (dave.isDancing) dave.toggleDance();
+  if (dave.currentInteraction) dave.endInteractionWithReverseAnim();
+  dave.danceLookTarget = null;
+  dave.gazeOverride = null;
+  dave.scripted = false;
+  tvUserMediaActive = false;
+  scene.activeCameras = filmShot.prevCameras;
+  filmShot.cam.dispose();
+  filmShot = null;
+  engine.resize();
+  updateViewports();
+}
+
+async function filmPreview() {
+  if (filming) return;
+  if (filmShot) _endFilmShot();
+  else await _startLoopShot();
+}
+
+async function filmStoryPreview() {
+  if (filming) return;
+  if (filmShot) _endFilmShot();
+  else await _startStoryShot();
+}
+
+// Record the canvas + `audioUrl` from when `begin()` runs until `done`
+// resolves, then download as `name`. Set the shot up before calling.
+async function _record(audioUrl, name, begin, done, audio, audioCtx) {
+  // Audio routed both to the speakers and the recording.
+  const audioSrc = audioCtx.createMediaElementSource(audio);
+  const audioOut = audioCtx.createMediaStreamDestination();
+  audioSrc.connect(audioOut);
+  audioSrc.connect(audioCtx.destination);
+  if (audio.readyState < 4) {
+    await new Promise((resolve, reject) => {
+      audio.oncanplaythrough = resolve;
+      audio.onerror = () => reject(new Error(`can't load ${audioUrl}`));
+    });
+  }
+  await new Promise((r) => setTimeout(r, 1000)); // let Dave land
+  // Don't roll until the TV's video is actually playing (up to 10s).
+  for (let i = 0; i < 100 && tvVideoElement && tvVideoElement.readyState < 3; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  const stream = canvas.captureStream(30);
+  audioOut.stream.getAudioTracks().forEach((t) => stream.addTrack(t));
+  const mimeType = _filmMimeType();
+  const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 8e6 });
+  const chunks = [];
+  recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+  const stopped = new Promise((r) => (recorder.onstop = r));
+
+  recorder.start();
+  begin();
+  await audio.play();
+  await done();
+  recorder.stop();
+  await stopped;
+  audio.pause();
+  audioCtx.close();
+
+  const ext = mimeType.includes("mp4") ? "mp4" : "webm";
+  // Kept so a failed save can be retried: saveLastTake()
+  window.lastFilmTake = { blob: new Blob(chunks, { type: mimeType }), name: `${name}.${ext}` };
+  await saveLastTake();
+}
+
+// In dev the Vite server writes the take straight into ~/Downloads (see
+// vite.config.js) — no browser download prompts, any number of takes.
+// Otherwise, or if that fails, fall back to a normal browser download.
+async function saveLastTake() {
+  const take = window.lastFilmTake;
+  if (!take) return;
+  if (import.meta.env?.DEV) {
+    try {
+      const r = await fetch(`/__film/save?name=${encodeURIComponent(take.name)}`, {
+        method: "POST",
+        body: take.blob,
+      });
+      if (r.ok) {
+        console.log(`[Film] saved ${(await r.json()).path}`);
+        return;
+      }
+    } catch (err) {
+      console.warn("[Film] dev save failed, downloading instead:", err);
+    }
+  }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(take.blob);
+  a.download = take.name;
+  a.click();
+  console.log(`[Film] downloaded ${take.name}`);
+}
+window.saveLastTake = saveLastTake;
+
+async function filmDance() {
+  if (filming || !dave.ANIM_MAP[FILM.LOOP.CLIP]) return;
+  filming = true;
+  try {
+    // Unlock audio while we still hold the key press's user activation.
+    const audio = new Audio(FILM.LOOP.AUDIO_URL);
+    const audioCtx = new AudioContext();
+    if (!filmShot) await _startLoopShot();
+    await _record(
+      FILM.LOOP.AUDIO_URL,
+      `dave-${FILM.LOOP.CLIP}`,
+      () => {
+        dave.danceAnim.goToFrame(dave.danceAnim.from);
+        dave.danceAnim.play(true);
+      },
+      // Stop when the dance first loops.
+      () => new Promise((r) => dave.danceAnim.onAnimationGroupLoopObservable.addOnce(r)),
+      audio,
+      audioCtx,
+    );
+  } catch (err) {
+    console.error("[Film] failed:", err);
+  } finally {
+    _endFilmShot();
+    filming = false;
+  }
+}
+
+// The story runs off the audio clock, so the dance lands exactly where the
+// dancer's did: watch TV → get up → walk to the mark → face the camera → dance.
+async function filmStory() {
+  const ST = FILM.STORY;
+  if (filming || !dave.ANIM_MAP[ST.CLIP] || !couchDescriptor) return;
+  filming = true;
+  try {
+    const audio = new Audio(ST.AUDIO_URL);
+    const audioCtx = new AudioContext();
+    if (!filmShot?.story) {
+      if (filmShot) _endFilmShot();
+      await _startStoryShot();
+    }
+    const { mark, camPos } = filmShot.story;
+    filmShot.audio = audio;
+    let phase = "watching";
+    const tv = ST.TV_URL ? tvVideoElement : null;
+    const tick = () => {
+      const t = audio.currentTime;
+      const dt = engine.getDeltaTime() / 1000;
+      // Keep the TV's copy of the source clip on the audio's clock.
+      if (tv && !audio.paused && Math.abs(tv.currentTime - t) > ST.TV_SYNC_TOLERANCE) {
+        tv.currentTime = t;
+      }
+      if (phase === "watching" && t >= ST.GET_UP_AT) {
+        phase = "getting-up";
+        filmShot.gait = Object.fromEntries(Object.keys(ST.GAIT).map((k) => [k, dave.gait[k]]));
+        Object.assign(dave.gait, ST.GAIT);
+        dave.gazeOverride = camPos.clone(); // from here on, he plays to camera
+        dave.endInteractionWithReverseAnim();
+      } else if (phase === "getting-up" && dave.state === S.IDLE) {
+        phase = "walking";
+        dave.wanderTarget = mark.clone();
+        dave.pathfinder.reset();
+        // Straight into walking — it steers as it goes — rather than first
+        // turning on the spot (~0.9s of standing still before the first step).
+        dave._setState(S.TURNING);
+        dave._setState(S.WALKING);
+      } else if (phase === "walking" && dave.state === S.IDLE) {
+        phase = "arrived";
+        dave.wanderTimer = Infinity;
+      } else if (phase === "arrived") {
+        dave.rotateToward(dave.getForwardAngle(camPos), dt);
+      }
+      if (phase !== "dancing" && t >= ST.DANCE_AT) {
+        // Dance on the beat wherever he's got to, facing the camera.
+        if (dave.state !== S.IDLE) dave._exitToIdle();
+        dave.wanderTimer = Infinity;
+        dave.root.rotation.y = dave.getForwardAngle(camPos);
+        dave.gazeOverride = null;
+        const clip = dave.ANIM_MAP[ST.CLIP];
+        filmShot.blendRestore = { clip, on: clip.enableBlending, speed: clip.blendingSpeed };
+        clip.enableBlending = true;
+        clip.blendingSpeed = ST.DANCE_BLEND;
+        dave.toggleDance(ST.CLIP);
+        filmShot.danceStartedAt = performance.now() / 1000;
+        phase = "dancing";
+      }
+    };
+    await _record(
+      ST.AUDIO_URL,
+      "dave-dance-story",
+      () => {
+        filmShot.observer = scene.onBeforeRenderObservable.add(tick);
+        if (tv) {
+          tv.currentTime = 0;
+          tv.play().catch(() => {});
+        }
+      },
+      // Stop when the dance has played through once.
+      () =>
+        new Promise((r) => {
+          const wait = () =>
+            phase === "dancing"
+              ? dave.danceAnim.onAnimationGroupLoopObservable.addOnce(r)
+              : setTimeout(wait, 50);
+          wait();
+        }),
+      audio,
+      audioCtx,
+    );
+  } catch (err) {
+    console.error("[Film] story failed:", err);
+  } finally {
+    _endFilmShot();
+    filming = false;
+  }
+}
+window.filmDance = filmDance;
+window.filmPreview = filmPreview;
+window.filmStory = filmStory;
+window.filmStoryPreview = filmStoryPreview;
+
+// Keyboard shortcuts: 'C' previews / 'F' films the loop; with Shift, the story
+window.addEventListener("keydown", (event) => {
+  const key = event.key.toLowerCase();
+  if (
+    (key === "c" || key === "f") &&
+    !event.ctrlKey &&
+    !event.altKey &&
+    !event.metaKey
+  ) {
+    // Make sure we're not typing in an input field
+    if (document.activeElement.tagName !== "INPUT") {
+      if (event.shiftKey) {
+        if (key === "c") filmStoryPreview();
+        else filmStory();
+      } else if (key === "c") filmPreview();
+      else filmDance();
+    }
+  }
 });

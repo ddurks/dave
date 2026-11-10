@@ -1,6 +1,7 @@
 import { defineConfig } from "vite";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 
 // Vite acts purely as dev server + bundler for the ES module graph.
@@ -50,7 +51,12 @@ export default defineConfig(({ command }) => ({
     // accepts it instead of trying to lower for older browsers.
     target: "es2022",
   },
-  plugins: command === "build" ? [injectApiUrl(PROD_API_URL), copyAssets()] : [],
+  // Dev can point at a mind on another port the same way, e.g. when :3000 is
+  // taken: DAVE_API_URL=http://127.0.0.1:3001 npm run dev
+  plugins:
+    command === "build"
+      ? [injectApiUrl(PROD_API_URL), copyAssets()]
+      : [saveFilmTakes(), ...(process.env.DAVE_API_URL ? [injectApiUrl(process.env.DAVE_API_URL)] : [])],
 }));
 
 function injectApiUrl(url) {
@@ -85,6 +91,43 @@ function copyAssets() {
           fs.copyFileSync(from, path.join(dest, name));
         }
       }
+    },
+  };
+}
+
+/**
+ * Dev only: POST /__film/save?name=<file> writes the request body (a film-mode
+ * take, see dave-scene.js) into ~/Downloads, never overwriting — a taken name
+ * gets -2, -3, ... Saving this way sidesteps the browser's limits on pages
+ * that download several files on their own.
+ */
+function saveFilmTakes() {
+  const DIR = path.join(os.homedir(), "Downloads");
+  return {
+    name: "dave-save-film-takes",
+    configureServer(server) {
+      server.middlewares.use("/__film/save", (req, res) => {
+        if (req.method !== "POST") {
+          res.statusCode = 405;
+          return res.end();
+        }
+        const requested = new URL(req.url, "http://x").searchParams.get("name") || "take.mp4";
+        const base = path.basename(requested).replace(/[^\w.-]/g, "_");
+        const ext = path.extname(base);
+        const stem = base.slice(0, base.length - ext.length);
+        let file = path.join(DIR, base);
+        for (let i = 2; fs.existsSync(file); i++) file = path.join(DIR, `${stem}-${i}${ext}`);
+        const out = fs.createWriteStream(file);
+        req.pipe(out);
+        out.on("finish", () => {
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify({ path: file }));
+        });
+        out.on("error", (err) => {
+          res.statusCode = 500;
+          res.end(String(err));
+        });
+      });
     },
   };
 }

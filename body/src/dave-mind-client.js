@@ -9,6 +9,8 @@ export class DaveMindClient {
     this.queryUrl = `${apiBaseUrl}/query`;
     this.sessionId = sessionId;
     this.userId = userId;
+    // Fields sent with every request, e.g. () => ({ buzz }). Optional.
+    this.extraBody = null;
     // Exponential backoff state — shared across all method types. When the
     // backend 429s (rate limit) or 5xxs (real error), block further requests
     // for an exponentially increasing window so the polling idle/browse loops
@@ -105,6 +107,36 @@ export class DaveMindClient {
   }
 
   /**
+   * Greet the visitor: back on the tab after `awayMinutes`, or (without it)
+   * back on the page if Dave has talked with them before.
+   * @returns {object|null} { text, emotion }, or null if there's nothing to say
+   */
+  async greet(awayMinutes = 0) {
+    const data = await this._post({
+      type: "greet",
+      sessionId: this.sessionId,
+      userId: this.userId,
+      ...(awayMinutes > 0 && { awayMinutes }),
+    });
+    return data.response || null;
+  }
+
+  /**
+   * Dave starts a conversation: one question for a quiet visitor.
+   * @param {string} doing - what he's doing, e.g. "sitting on the couch"
+   * @returns {object|null} { text, emotion }
+   */
+  async initiate(doing = "") {
+    const data = await this._post({
+      type: "initiate",
+      sessionId: this.sessionId,
+      userId: this.userId,
+      ...(doing && { context: doing }),
+    });
+    return data.response || null;
+  }
+
+  /**
    * Trigger an autonomous musing
    * @param {string} contextStr - Optional context for the musing
    * @returns {object} Object with prompt and response
@@ -182,7 +214,7 @@ export class DaveMindClient {
       res = await fetch(this.queryUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ ...this.extraBody?.(), ...body }),
       });
     } catch (networkErr) {
       // Network-level failure (DNS, offline, CORS preflight reject). Same
