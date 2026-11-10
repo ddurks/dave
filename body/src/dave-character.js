@@ -1229,6 +1229,10 @@ export class Dave {
   async loadLearnedDance({ id, url }) {
     const name = `dance_learned_${id}`;
     if (this.ANIM_MAP[name]) return name;
+    // The glTF loader raises every material in the scene to as many lights as
+    // the scene has, pulling the overhead light into the room's look. Put the
+    // limits back.
+    const limits = this.scene.materials.map((m) => [m, m.maxSimultaneousLights]);
     try {
       const container = await BABYLON.SceneLoader.LoadAssetContainerAsync(url, "", this.scene);
       const src = container.animationGroups[0];
@@ -1248,6 +1252,8 @@ export class Dave {
     } catch (err) {
       console.warn(`[Dave] learned dance ${id} failed to load`, err);
       return null;
+    } finally {
+      for (const [m, n] of limits) if (n !== undefined) m.maxSimultaneousLights = n;
     }
   }
 
