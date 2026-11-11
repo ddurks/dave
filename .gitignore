@@ -6,3 +6,5 @@ dist/
 
 # Blender save backups
 *.blend1
+.DS_Store
+mind/.dave-state.json
