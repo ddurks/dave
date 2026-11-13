@@ -10,7 +10,7 @@ CF_STACK="dave-mind-dev"
 REGION="us-east-1"
 DOMAIN="davemind.drawvid.com"
 S3_BUCKET="dave-drawvid-frontend"
-CF_DIST="E35QS6JIENO2IC"
+SITE="dave.drawvid.com"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 info()  { echo "▸ $*"; }
@@ -76,9 +76,16 @@ deploy_fe() {
 
   info "Syncing to S3…"
   # dances/ holds the clips Dave has learned (mind/dances.py), not build output.
-  aws s3 sync dist/ "s3://$S3_BUCKET" --delete --exclude "dances/*"
+  # no-cache: every file revalidates by ETag (a cheap 304 when unchanged), so
+  # the invalidation below is all it takes for a release to show.
+  aws s3 sync dist/ "s3://$S3_BUCKET" --delete --exclude "dances/*" --cache-control "no-cache"
 
   info "Invalidating CloudFront…"
+  # Found by its alias, so no id needs hardcoding.
+  CF_DIST=$(aws cloudfront list-distributions \
+    --query "DistributionList.Items[?Aliases.Items && contains(Aliases.Items, '$SITE')].Id | [0]" \
+    --output text)
+  [ -n "$CF_DIST" ] && [ "$CF_DIST" != "None" ] || fail "No CloudFront distribution for $SITE."
   INV_ID=$(aws cloudfront create-invalidation \
     --distribution-id "$CF_DIST" --paths "/*" \
     --query 'Invalidation.Id' --output text)
